@@ -38,13 +38,23 @@ Start from one of the included templates:
 {
   "telegram_token": "123456:telegram-token",
   "allowed_telegram_usernames": ["alice", "@bob"],
-  "google_drive_folder_id": "optional-folder-id"
+  "google_drive_folder_id": "optional-folder-id",
+  "proxy": {
+    "all": "socks5h://127.0.0.1:1080",
+    "telegram_receive": "",
+    "google_drive": ""
+  }
 }
 ```
 
 - `telegram_token` is required.
 - `allowed_telegram_usernames` is optional. If the list is non-empty, anyone not in the list is ignored without a reply. Usernames are case-insensitive and may include or omit `@`.
 - `google_drive_folder_id` is optional.
+- `proxy` is optional:
+  - `proxy.all` applies one proxy URL to all HTTP traffic.
+  - `proxy.telegram_receive` overrides proxy only for Telegram receive/download flow.
+  - `proxy.google_drive` overrides proxy only for Google Drive upload/auth flow.
+  - Empty strings are ignored.
 
 ## Option A: per-user OAuth consent flow
 

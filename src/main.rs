@@ -17,6 +17,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{Stream, StreamExt};
 use reqwest::{header, Client, StatusCode};
+use reqwest_011::{Client as TelegramApiClient, Proxy as TelegramApiProxy};
 use ring::signature::RsaKeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -35,7 +36,7 @@ const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // Google resumable uploads require mul
 
 #[derive(Clone)]
 struct AppState {
-    http: Client,
+    telegram_http: Client,
     drive: Arc<DriveClient>,
     access: Arc<AccessControl>,
 }
@@ -50,6 +51,29 @@ struct Config {
     google: GoogleConfig,
     #[serde(default)]
     oauth_server: OAuthServerConfig,
+    #[serde(default)]
+    proxy: ProxyConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ProxyConfig {
+    #[serde(default)]
+    all: Option<String>,
+    #[serde(default)]
+    telegram_receive: Option<String>,
+    #[serde(default)]
+    google_drive: Option<String>,
+}
+
+impl ProxyConfig {
+    fn telegram_receive(&self) -> Option<&str> {
+        normalized_proxy(self.telegram_receive.as_ref())
+            .or_else(|| normalized_proxy(self.all.as_ref()))
+    }
+
+    fn google_drive(&self) -> Option<&str> {
+        normalized_proxy(self.google_drive.as_ref()).or_else(|| normalized_proxy(self.all.as_ref()))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -236,19 +260,18 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let config = load_config().await?;
-    let bot = Bot::new(config.telegram_token.clone());
-    let http = Client::builder()
-        .pool_idle_timeout(Duration::from_secs(90))
-        .tcp_nodelay(true)
-        .build()?;
-    let drive = Arc::new(DriveClient::from_config(http.clone(), &config).await?);
+    let telegram_http = build_http_client(config.proxy.telegram_receive())?;
+    let telegram_api_http = build_telegram_api_client(config.proxy.telegram_receive())?;
+    let drive_http = build_http_client(config.proxy.google_drive())?;
+    let bot = Bot::with_client(config.telegram_token.clone(), telegram_api_http);
+    let drive = Arc::new(DriveClient::from_config(drive_http, &config).await?);
 
     if drive.uses_oauth() {
         spawn_oauth_server(bot.clone(), drive.clone(), config.oauth_server.bind_addr).await?;
     }
 
     let state = AppState {
-        http,
+        telegram_http,
         drive,
         access: Arc::new(AccessControl::from_config(&config)),
     };
@@ -367,7 +390,7 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
         .await
         .context("failed to get Telegram file metadata")?;
     let total_size = file.size as u64;
-    let telegram_stream = telegram_file_stream(&state.http, bot.token(), &file.path).await?;
+    let telegram_stream = telegram_file_stream(&state.telegram_http, bot.token(), &file.path).await?;
     let uploaded = state
         .drive
         .upload_stream(
@@ -413,6 +436,43 @@ fn telegram_user_id(msg: &Message) -> Option<u64> {
 
 fn normalize_username(username: &str) -> String {
     username.trim().trim_start_matches('@').to_ascii_lowercase()
+}
+
+fn normalized_proxy(value: Option<&String>) -> Option<&str> {
+    value.and_then(|proxy| {
+        let trimmed = proxy.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn build_http_client(proxy: Option<&str>) -> Result<Client> {
+    let mut builder = Client::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_nodelay(true);
+    if let Some(proxy_url) = proxy {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .with_context(|| format!("invalid proxy URL in config.proxy: {proxy_url}"))?;
+        builder = builder.proxy(proxy);
+    }
+    builder.build().context("failed to build HTTP client")
+}
+
+fn build_telegram_api_client(proxy: Option<&str>) -> Result<TelegramApiClient> {
+    let mut builder = TelegramApiClient::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_nodelay(true);
+    if let Some(proxy_url) = proxy {
+        let proxy = TelegramApiProxy::all(proxy_url)
+            .with_context(|| format!("invalid proxy URL in config.proxy: {proxy_url}"))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .context("failed to build Telegram API client")
 }
 
 fn format_bytes(bytes: u64) -> String {
