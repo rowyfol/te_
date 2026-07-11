@@ -1,10 +1,19 @@
 use std::{
+    collections::{HashMap, HashSet},
     env,
+    net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
+use axum::{
+    extract::{Query, State},
+    response::{Html, IntoResponse},
+    routing::get,
+    Router,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{Stream, StreamExt};
 use reqwest::{header, Client, StatusCode};
@@ -17,6 +26,7 @@ use teloxide::{
 };
 use tokio::sync::Mutex;
 use tracing::{error, info};
+use uuid::Uuid;
 
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -27,6 +37,37 @@ const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // Google resumable uploads require mul
 struct AppState {
     http: Client,
     drive: Arc<DriveClient>,
+    access: Arc<AccessControl>,
+}
+
+#[derive(Debug)]
+struct AccessControl {
+    allowed_usernames: HashSet<String>,
+}
+
+impl AccessControl {
+    fn from_env() -> Self {
+        let allowed_usernames = env::var("ALLOWED_TELEGRAM_USERNAMES")
+            .unwrap_or_default()
+            .split(',')
+            .map(normalize_username)
+            .filter(|username| !username.is_empty())
+            .collect();
+        Self { allowed_usernames }
+    }
+
+    fn is_allowed(&self, msg: &Message) -> bool {
+        // If no list is configured, keep local/dev usage convenient and allow everyone.
+        if self.allowed_usernames.is_empty() {
+            return true;
+        }
+
+        msg.from
+            .as_ref()
+            .and_then(|user| user.username.as_deref())
+            .map(normalize_username)
+            .is_some_and(|username| self.allowed_usernames.contains(&username))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +82,13 @@ fn default_token_uri() -> String {
     TOKEN_URL.to_owned()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedOAuthToken {
+    access_token: String,
+    refresh_token: String,
+    expires_at_unix: u64,
+}
+
 #[derive(Debug)]
 struct AccessToken {
     value: String,
@@ -48,17 +96,39 @@ struct AccessToken {
 }
 
 #[derive(Debug)]
+enum DriveAuth {
+    ServiceAccount {
+        key: ServiceAccountKey,
+        token: Mutex<Option<AccessToken>>,
+    },
+    OAuth {
+        client_id: String,
+        client_secret: String,
+        redirect_uri: String,
+        tokens_path: PathBuf,
+        tokens: Mutex<HashMap<u64, PersistedOAuthToken>>,
+        pending_states: Mutex<HashMap<String, PendingOAuth>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PendingOAuth {
+    telegram_user_id: u64,
+    chat_id: ChatId,
+}
+
+#[derive(Debug)]
 struct DriveClient {
     http: Client,
-    key: ServiceAccountKey,
     folder_id: Option<String>,
-    token: Mutex<Option<AccessToken>>,
+    auth: DriveAuth,
 }
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
     expires_in: u64,
+    refresh_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +146,13 @@ struct Claims<'a> {
     aud: &'a str,
     exp: u64,
     iat: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthCallback {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
 }
 
 #[tokio::main]
@@ -99,13 +176,26 @@ async fn run() -> Result<()> {
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_nodelay(true)
         .build()?;
-    let drive = Arc::new(DriveClient::from_env(http.clone())?);
-    let state = AppState { http, drive };
+    let drive = Arc::new(DriveClient::from_env(http.clone()).await?);
+
+    if drive.uses_oauth() {
+        spawn_oauth_server(bot.clone(), drive.clone()).await?;
+    }
+
+    let state = AppState {
+        http,
+        drive,
+        access: Arc::new(AccessControl::from_env()),
+    };
 
     info!("starting Telegram → Google Drive uploader bot");
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let state = state.clone();
         async move {
+            if !state.access.is_allowed(&msg) {
+                return respond(());
+            }
+
             if let Err(err) = handle_message(bot.clone(), msg.clone(), state).await {
                 error!(chat_id = msg.chat.id.0, error = ?err, "failed to process message");
                 bot.send_message(msg.chat.id, format!("Upload failed: {err:#}"))
@@ -118,11 +208,93 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+async fn spawn_oauth_server(bot: Bot, drive: Arc<DriveClient>) -> Result<()> {
+    let addr: SocketAddr = env::var("OAUTH_BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
+        .parse()
+        .context("invalid OAUTH_BIND_ADDR")?;
+    let app = Router::new()
+        .route("/oauth2/callback", get(oauth_callback))
+        .with_state((bot, drive));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            error!(error = ?err, "OAuth callback server stopped");
+        }
+    });
+    info!(%addr, "OAuth callback server listening");
+    Ok(())
+}
+
+async fn oauth_callback(
+    State((bot, drive)): State<(Bot, Arc<DriveClient>)>,
+    Query(query): Query<OAuthCallback>,
+) -> impl IntoResponse {
+    match oauth_callback_inner(bot, drive, query).await {
+        Ok(()) => Html(
+            "<h1>Google Drive connected</h1><p>You can close this page and return to Telegram.</p>",
+        )
+        .into_response(),
+        Err(err) => Html(format!("<h1>Authorization failed</h1><p>{err:#}</p>")).into_response(),
+    }
+}
+
+async fn oauth_callback_inner(
+    bot: Bot,
+    drive: Arc<DriveClient>,
+    query: OAuthCallback,
+) -> Result<()> {
+    if let Some(error) = query.error {
+        return Err(anyhow!("Google returned OAuth error: {error}"));
+    }
+    let code = query.code.context("missing OAuth code")?;
+    let state = query.state.context("missing OAuth state")?;
+    let pending = drive.complete_oauth(&state, &code).await?;
+    bot.send_message(
+        pending.chat_id,
+        "Google Drive connected. Send a file and I will upload it to your Drive.",
+    )
+    .await?;
+    Ok(())
+}
+
 async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
+    if let Some(text) = msg.text() {
+        if text == "/start" || text == "/help" {
+            bot.send_message(msg.chat.id, help_text(state.drive.uses_oauth()))
+                .await?;
+            return Ok(());
+        }
+        if text == "/auth" {
+            let user_id = telegram_user_id(&msg).context("could not identify Telegram user")?;
+            let url = state.drive.authorization_url(user_id, msg.chat.id).await?;
+            bot.send_message(
+                msg.chat.id,
+                format!("Open this URL to connect Google Drive:\n{url}"),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     let Some(incoming) = extract_incoming_file(&msg) else {
-        bot.send_message(msg.chat.id, "Send me a document, video, audio, voice, photo, or other file and I will stream it to Google Drive.").await?;
+        bot.send_message(
+            msg.chat.id,
+            "Send me a file to upload. Use /auth first when OAuth mode is enabled.",
+        )
+        .await?;
         return Ok(());
     };
+    let user_id = telegram_user_id(&msg).context("could not identify Telegram user")?;
+    if state.drive.uses_oauth() && !state.drive.has_oauth_token(user_id).await {
+        let url = state.drive.authorization_url(user_id, msg.chat.id).await?;
+        bot.send_message(
+            msg.chat.id,
+            format!("Please connect Google Drive first:\n{url}"),
+        )
+        .await?;
+        return Ok(());
+    }
 
     bot.send_message(
         msg.chat.id,
@@ -138,6 +310,7 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
     let uploaded = state
         .drive
         .upload_stream(
+            user_id,
             &incoming.name,
             incoming.mime_type.as_deref(),
             total_size,
@@ -163,6 +336,22 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+fn help_text(oauth_enabled: bool) -> &'static str {
+    if oauth_enabled {
+        "Send /auth to connect your Google Drive, then send me files to upload."
+    } else {
+        "Send me files and I will upload them to the configured Google Drive service-account destination."
+    }
+}
+
+fn telegram_user_id(msg: &Message) -> Option<u64> {
+    msg.from.as_ref().map(|user| user.id.0)
+}
+
+fn normalize_username(username: &str) -> String {
+    username.trim().trim_start_matches('@').to_ascii_lowercase()
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -219,6 +408,7 @@ fn from_document(doc: &Document) -> IncomingFile {
         mime_type: doc.mime_type.as_ref().map(ToString::to_string),
     }
 }
+
 fn from_video(video: &Video) -> IncomingFile {
     IncomingFile {
         file_id: video.file.id.clone(),
@@ -229,6 +419,7 @@ fn from_video(video: &Video) -> IncomingFile {
         mime_type: video.mime_type.as_ref().map(ToString::to_string),
     }
 }
+
 fn largest_photo(photos: &[PhotoSize]) -> Option<&PhotoSize> {
     photos.iter().max_by_key(|p| p.file.size)
 }
@@ -249,26 +440,140 @@ async fn telegram_file_stream(
 }
 
 impl DriveClient {
-    fn from_env(http: Client) -> Result<Self> {
-        let key_json = match env::var("GOOGLE_SERVICE_ACCOUNT_JSON") {
-            Ok(raw) => raw,
-            Err(_) => std::fs::read_to_string(
-                env::var("GOOGLE_SERVICE_ACCOUNT_FILE")
-                    .context("set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE")?,
-            )?,
+    async fn from_env(http: Client) -> Result<Self> {
+        let folder_id = env::var("GOOGLE_DRIVE_FOLDER_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let auth = if let Ok(client_id) = env::var("GOOGLE_OAUTH_CLIENT_ID") {
+            let client_secret = env::var("GOOGLE_OAUTH_CLIENT_SECRET")
+                .context("set GOOGLE_OAUTH_CLIENT_SECRET when GOOGLE_OAUTH_CLIENT_ID is set")?;
+            let redirect_uri = env::var("GOOGLE_OAUTH_REDIRECT_URI").context(
+                "set GOOGLE_OAUTH_REDIRECT_URI, for example https://your-domain/oauth2/callback",
+            )?;
+            let tokens_path = env::var("GOOGLE_OAUTH_TOKENS_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("google-oauth-tokens.json"));
+            let tokens = load_oauth_tokens(&tokens_path).await?;
+            DriveAuth::OAuth {
+                client_id,
+                client_secret,
+                redirect_uri,
+                tokens_path,
+                tokens: Mutex::new(tokens),
+                pending_states: Mutex::new(HashMap::new()),
+            }
+        } else {
+            let key_json = match env::var("GOOGLE_SERVICE_ACCOUNT_JSON") {
+                Ok(raw) => raw,
+                Err(_) => std::fs::read_to_string(
+                    env::var("GOOGLE_SERVICE_ACCOUNT_FILE").context(
+                        "set OAuth env vars or GOOGLE_SERVICE_ACCOUNT_JSON/GOOGLE_SERVICE_ACCOUNT_FILE",
+                    )?,
+                )?,
+            };
+            DriveAuth::ServiceAccount {
+                key: serde_json::from_str(&key_json)
+                    .context("invalid Google service-account JSON")?,
+                token: Mutex::new(None),
+            }
         };
+
         Ok(Self {
             http,
-            key: serde_json::from_str(&key_json).context("invalid Google service-account JSON")?,
-            folder_id: env::var("GOOGLE_DRIVE_FOLDER_ID")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            token: Mutex::new(None),
+            folder_id,
+            auth,
         })
+    }
+
+    fn uses_oauth(&self) -> bool {
+        matches!(self.auth, DriveAuth::OAuth { .. })
+    }
+
+    async fn has_oauth_token(&self, telegram_user_id: u64) -> bool {
+        match &self.auth {
+            DriveAuth::OAuth { tokens, .. } => tokens.lock().await.contains_key(&telegram_user_id),
+            DriveAuth::ServiceAccount { .. } => true,
+        }
+    }
+
+    async fn authorization_url(&self, telegram_user_id: u64, chat_id: ChatId) -> Result<String> {
+        let DriveAuth::OAuth {
+            client_id,
+            redirect_uri,
+            pending_states,
+            ..
+        } = &self.auth
+        else {
+            return Err(anyhow!("OAuth is not enabled for this bot"));
+        };
+        let state = Uuid::new_v4().to_string();
+        pending_states.lock().await.insert(
+            state.clone(),
+            PendingOAuth {
+                telegram_user_id,
+                chat_id,
+            },
+        );
+        Ok(format!(
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
+            urlencoding::encode(client_id),
+            urlencoding::encode(redirect_uri),
+            urlencoding::encode(DRIVE_SCOPE),
+            urlencoding::encode(&state)
+        ))
+    }
+
+    async fn complete_oauth(&self, state: &str, code: &str) -> Result<PendingOAuth> {
+        let DriveAuth::OAuth {
+            client_id,
+            client_secret,
+            redirect_uri,
+            tokens_path,
+            tokens,
+            pending_states,
+        } = &self.auth
+        else {
+            return Err(anyhow!("OAuth is not enabled for this bot"));
+        };
+        let pending = pending_states
+            .lock()
+            .await
+            .remove(state)
+            .context("unknown or expired OAuth state")?;
+        let response: TokenResponse = self
+            .http
+            .post(TOKEN_URL)
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("code", code),
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", redirect_uri.as_str()),
+            ])
+            .send()
+            .await
+            .context("failed to exchange OAuth code")?
+            .error_for_status()?
+            .json()
+            .await
+            .context("failed to parse OAuth token response")?;
+        let refresh_token = response.refresh_token.context(
+            "Google did not return a refresh token; revoke app access and run /auth again",
+        )?;
+        let token = PersistedOAuthToken {
+            access_token: response.access_token,
+            refresh_token,
+            expires_at_unix: unix_now() + response.expires_in,
+        };
+        let mut guard = tokens.lock().await;
+        guard.insert(pending.telegram_user_id, token);
+        save_oauth_tokens(tokens_path, &guard).await?;
+        Ok(pending)
     }
 
     async fn upload_stream<S>(
         &self,
+        telegram_user_id: u64,
         name: &str,
         mime_type: Option<&str>,
         total_size: u64,
@@ -277,8 +582,9 @@ impl DriveClient {
     where
         S: Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
     {
+        let token = self.access_token(telegram_user_id).await?;
         let session = self
-            .create_resumable_session(name, mime_type, total_size)
+            .create_resumable_session(&token, name, mime_type, total_size)
             .await?;
         let mut offset = 0_u64;
         let mut buffer = Vec::with_capacity(CHUNK_SIZE as usize);
@@ -299,11 +605,11 @@ impl DriveClient {
 
     async fn create_resumable_session(
         &self,
+        token: &str,
         name: &str,
         mime_type: Option<&str>,
         total_size: u64,
     ) -> Result<String> {
-        let token = self.access_token().await?;
         let mut metadata = json!({ "name": name });
         if let Some(folder_id) = &self.folder_id {
             metadata["parents"] = json!([folder_id]);
@@ -389,24 +695,54 @@ impl DriveClient {
             .context("failed to parse Drive upload response")
     }
 
-    async fn access_token(&self) -> Result<String> {
-        let now = Instant::now();
-        if let Some(token) = self.token.lock().await.as_ref() {
-            if token.expires_at > now + Duration::from_secs(60) {
-                return Ok(token.value.clone());
+    async fn access_token(&self, telegram_user_id: u64) -> Result<String> {
+        match &self.auth {
+            DriveAuth::ServiceAccount { key, token } => {
+                let now = Instant::now();
+                if let Some(token) = token.lock().await.as_ref() {
+                    if token.expires_at > now + Duration::from_secs(60) {
+                        return Ok(token.value.clone());
+                    }
+                }
+                let fresh = self.fetch_service_account_access_token(key).await?;
+                let value = fresh.value.clone();
+                *token.lock().await = Some(fresh);
+                Ok(value)
+            }
+            DriveAuth::OAuth {
+                tokens_path,
+                tokens,
+                ..
+            } => {
+                let current = tokens
+                    .lock()
+                    .await
+                    .get(&telegram_user_id)
+                    .cloned()
+                    .context("run /auth to connect Google Drive first")?;
+                if current.expires_at_unix > unix_now() + 60 {
+                    return Ok(current.access_token);
+                }
+                let refreshed = self
+                    .refresh_oauth_access_token(&current.refresh_token)
+                    .await?;
+                let value = refreshed.access_token.clone();
+                let mut guard = tokens.lock().await;
+                guard.insert(telegram_user_id, refreshed);
+                save_oauth_tokens(tokens_path, &guard).await?;
+                Ok(value)
             }
         }
-        let fresh = self.fetch_access_token().await?;
-        let value = fresh.value.clone();
-        *self.token.lock().await = Some(fresh);
-        Ok(value)
     }
 
-    async fn fetch_access_token(&self) -> Result<AccessToken> {
-        let assertion = self.signed_jwt()?;
+    async fn fetch_service_account_access_token(
+        &self,
+        key: &ServiceAccountKey,
+    ) -> Result<AccessToken> {
+        let assertion = self.signed_jwt(key)?;
         let response: TokenResponse = self
             .http
-            .post(&self.key.token_uri)
+            .post(&key.token_uri)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", assertion.as_str()),
@@ -424,15 +760,49 @@ impl DriveClient {
         })
     }
 
-    fn signed_jwt(&self) -> Result<String> {
+    async fn refresh_oauth_access_token(&self, refresh_token: &str) -> Result<PersistedOAuthToken> {
+        let DriveAuth::OAuth {
+            client_id,
+            client_secret,
+            ..
+        } = &self.auth
+        else {
+            return Err(anyhow!("OAuth is not enabled for this bot"));
+        };
+        let response: TokenResponse = self
+            .http
+            .post(TOKEN_URL)
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("refresh_token", refresh_token),
+                ("grant_type", "refresh_token"),
+            ])
+            .send()
+            .await
+            .context("failed to refresh OAuth token")?
+            .error_for_status()?
+            .json()
+            .await
+            .context("failed to parse OAuth refresh response")?;
+        Ok(PersistedOAuthToken {
+            access_token: response.access_token,
+            refresh_token: response
+                .refresh_token
+                .unwrap_or_else(|| refresh_token.to_owned()),
+            expires_at_unix: unix_now() + response.expires_in,
+        })
+    }
+
+    fn signed_jwt(&self, key: &ServiceAccountKey) -> Result<String> {
         let iat = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let header = json!({ "alg": "RS256", "typ": "JWT" });
         let claims = Claims {
-            iss: &self.key.client_email,
+            iss: &key.client_email,
             scope: DRIVE_SCOPE,
-            aud: &self.key.token_uri,
+            aud: &key.token_uri,
             iat,
             exp: iat + 3600,
         };
@@ -441,7 +811,7 @@ impl DriveClient {
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?),
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?)
         );
-        let der = pem_to_der(&self.key.private_key)?;
+        let der = pem_to_der(&key.private_key)?;
         let key_pair = RsaKeyPair::from_pkcs8(&der)
             .map_err(|_| anyhow!("invalid service-account private key"))?;
         let mut signature = vec![0; key_pair.public().modulus_len()];
@@ -458,6 +828,31 @@ impl DriveClient {
             URL_SAFE_NO_PAD.encode(signature)
         ))
     }
+}
+
+async fn load_oauth_tokens(path: &PathBuf) -> Result<HashMap<u64, PersistedOAuthToken>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("invalid OAuth token store"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(err) => Err(err).context("failed to read OAuth token store"),
+    }
+}
+
+async fn save_oauth_tokens(
+    path: &PathBuf,
+    tokens: &HashMap<u64, PersistedOAuthToken>,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(tokens)?;
+    tokio::fs::write(path, bytes)
+        .await
+        .context("failed to write OAuth token store")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
