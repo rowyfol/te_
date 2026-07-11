@@ -55,6 +55,7 @@ struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum GoogleConfig {
+    #[serde(rename = "oauth", alias = "o_auth")]
     OAuth {
         client_id: String,
         client_secret: String,
