@@ -40,17 +40,80 @@ struct AppState {
     access: Arc<AccessControl>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct Config {
+    telegram_token: String,
+    #[serde(default)]
+    allowed_telegram_usernames: Vec<String>,
+    #[serde(default)]
+    google_drive_folder_id: Option<String>,
+    google: GoogleConfig,
+    #[serde(default)]
+    oauth_server: OAuthServerConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum GoogleConfig {
+    OAuth {
+        client_id: String,
+        client_secret: String,
+        redirect_uri: String,
+        #[serde(default = "default_oauth_tokens_file")]
+        tokens_file: PathBuf,
+    },
+    ServiceAccount {
+        #[serde(default)]
+        json_file: Option<PathBuf>,
+        #[serde(default)]
+        json: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OAuthServerConfig {
+    #[serde(default = "default_oauth_bind_addr")]
+    bind_addr: SocketAddr,
+}
+
+impl Default for OAuthServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_oauth_bind_addr(),
+        }
+    }
+}
+
+fn default_oauth_bind_addr() -> SocketAddr {
+    "0.0.0.0:8080".parse().expect("valid default bind address")
+}
+
+fn default_oauth_tokens_file() -> PathBuf {
+    PathBuf::from("google-oauth-tokens.json")
+}
+
+async fn load_config() -> Result<Config> {
+    let path = env::args()
+        .nth(1)
+        .or_else(|| env::var("CONFIG_PATH").ok())
+        .unwrap_or_else(|| "config.json".to_owned());
+    let bytes = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("failed to read config file at {path}"))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON config at {path}"))
+}
+
 #[derive(Debug)]
 struct AccessControl {
     allowed_usernames: HashSet<String>,
 }
 
 impl AccessControl {
-    fn from_env() -> Self {
-        let allowed_usernames = env::var("ALLOWED_TELEGRAM_USERNAMES")
-            .unwrap_or_default()
-            .split(',')
-            .map(normalize_username)
+    fn from_config(config: &Config) -> Self {
+        let allowed_usernames = config
+            .allowed_telegram_usernames
+            .iter()
+            .map(|username| normalize_username(username))
             .filter(|username| !username.is_empty())
             .collect();
         Self { allowed_usernames }
@@ -171,21 +234,22 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    let bot = Bot::from_env();
+    let config = load_config().await?;
+    let bot = Bot::new(config.telegram_token.clone());
     let http = Client::builder()
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_nodelay(true)
         .build()?;
-    let drive = Arc::new(DriveClient::from_env(http.clone()).await?);
+    let drive = Arc::new(DriveClient::from_config(http.clone(), &config).await?);
 
     if drive.uses_oauth() {
-        spawn_oauth_server(bot.clone(), drive.clone()).await?;
+        spawn_oauth_server(bot.clone(), drive.clone(), config.oauth_server.bind_addr).await?;
     }
 
     let state = AppState {
         http,
         drive,
-        access: Arc::new(AccessControl::from_env()),
+        access: Arc::new(AccessControl::from_config(&config)),
     };
 
     info!("starting Telegram → Google Drive uploader bot");
@@ -208,11 +272,7 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn spawn_oauth_server(bot: Bot, drive: Arc<DriveClient>) -> Result<()> {
-    let addr: SocketAddr = env::var("OAUTH_BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
-        .parse()
-        .context("invalid OAUTH_BIND_ADDR")?;
+async fn spawn_oauth_server(bot: Bot, drive: Arc<DriveClient>, addr: SocketAddr) -> Result<()> {
     let app = Router::new()
         .route("/oauth2/callback", get(oauth_callback))
         .with_state((bot, drive));
@@ -440,41 +500,48 @@ async fn telegram_file_stream(
 }
 
 impl DriveClient {
-    async fn from_env(http: Client) -> Result<Self> {
-        let folder_id = env::var("GOOGLE_DRIVE_FOLDER_ID")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let auth = if let Ok(client_id) = env::var("GOOGLE_OAUTH_CLIENT_ID") {
-            let client_secret = env::var("GOOGLE_OAUTH_CLIENT_SECRET")
-                .context("set GOOGLE_OAUTH_CLIENT_SECRET when GOOGLE_OAUTH_CLIENT_ID is set")?;
-            let redirect_uri = env::var("GOOGLE_OAUTH_REDIRECT_URI").context(
-                "set GOOGLE_OAUTH_REDIRECT_URI, for example https://your-domain/oauth2/callback",
-            )?;
-            let tokens_path = env::var("GOOGLE_OAUTH_TOKENS_FILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("google-oauth-tokens.json"));
-            let tokens = load_oauth_tokens(&tokens_path).await?;
-            DriveAuth::OAuth {
+    async fn from_config(http: Client, config: &Config) -> Result<Self> {
+        let folder_id = config
+            .google_drive_folder_id
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned();
+        let auth = match &config.google {
+            GoogleConfig::OAuth {
                 client_id,
                 client_secret,
                 redirect_uri,
-                tokens_path,
-                tokens: Mutex::new(tokens),
-                pending_states: Mutex::new(HashMap::new()),
+                tokens_file,
+            } => {
+                let tokens = load_oauth_tokens(tokens_file).await?;
+                DriveAuth::OAuth {
+                    client_id: client_id.clone(),
+                    client_secret: client_secret.clone(),
+                    redirect_uri: redirect_uri.clone(),
+                    tokens_path: tokens_file.clone(),
+                    tokens: Mutex::new(tokens),
+                    pending_states: Mutex::new(HashMap::new()),
+                }
             }
-        } else {
-            let key_json = match env::var("GOOGLE_SERVICE_ACCOUNT_JSON") {
-                Ok(raw) => raw,
-                Err(_) => std::fs::read_to_string(
-                    env::var("GOOGLE_SERVICE_ACCOUNT_FILE").context(
-                        "set OAuth env vars or GOOGLE_SERVICE_ACCOUNT_JSON/GOOGLE_SERVICE_ACCOUNT_FILE",
-                    )?,
-                )?,
-            };
-            DriveAuth::ServiceAccount {
-                key: serde_json::from_str(&key_json)
-                    .context("invalid Google service-account JSON")?,
-                token: Mutex::new(None),
+            GoogleConfig::ServiceAccount { json_file, json } => {
+                let key_json = match (json, json_file) {
+                    (Some(raw), _) if !raw.is_empty() => raw.clone(),
+                    (_, Some(path)) => {
+                        tokio::fs::read_to_string(path).await.with_context(|| {
+                            format!("failed to read service-account JSON at {}", path.display())
+                        })?
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "service_account mode requires google.json_file or google.json"
+                        ))
+                    }
+                };
+                DriveAuth::ServiceAccount {
+                    key: serde_json::from_str(&key_json)
+                        .context("invalid Google service-account JSON")?,
+                    token: Mutex::new(None),
+                }
             }
         };
 
