@@ -4,6 +4,7 @@ A resource-efficient Telegram bot written with [`teloxide`](https://github.com/t
 
 ## Features
 
+- One constant Linux executable plus one JSON config file for deployment.
 - Accepts documents, videos, audio, voice messages, and photos.
 - Downloads from Telegram as an async byte stream.
 - Uploads to Google Drive in 8 MiB resumable chunks, so files are never fully buffered in RAM or written to disk.
@@ -14,28 +15,36 @@ A resource-efficient Telegram bot written with [`teloxide`](https://github.com/t
 - Supports multiple Telegram users with separate OAuth token storage.
 - Supports an optional Telegram username allow-list; disallowed users are ignored completely.
 - Supports an optional destination Drive folder.
+- Includes a GitHub Actions workflow that builds and publishes a Linux AMD64 binary archive.
 
-## Common setup
+## Configuration file
 
-1. Create a Telegram bot with BotFather and export its token:
+The bot reads `config.json` by default. You can pass another path as the first CLI argument or set `CONFIG_PATH`:
 
-   ```bash
-   export TELOXIDE_TOKEN='123456:telegram-token'
-   ```
+```bash
+./telegram-drive-uploader /etc/telegram-drive-uploader/config.json
+# or
+CONFIG_PATH=/etc/telegram-drive-uploader/config.json ./telegram-drive-uploader
+```
 
-2. Optionally restrict the bot to specific Telegram usernames. Usernames are comma-separated, case-insensitive, and may include or omit `@`:
+Start from one of the included templates:
 
-   ```bash
-   export ALLOWED_TELEGRAM_USERNAMES='alice,@bob,charlie'
-   ```
+- `config.example.json` for per-user OAuth mode.
+- `config.service-account.example.json` for service-account mode.
 
-   If this variable is set, anyone not on the list is ignored without a reply.
+### Common JSON fields
 
-3. Optionally target a specific Drive folder:
+```json
+{
+  "telegram_token": "123456:telegram-token",
+  "allowed_telegram_usernames": ["alice", "@bob"],
+  "google_drive_folder_id": "optional-folder-id"
+}
+```
 
-   ```bash
-   export GOOGLE_DRIVE_FOLDER_ID='your-folder-id'
-   ```
+- `telegram_token` is required.
+- `allowed_telegram_usernames` is optional. If the list is non-empty, anyone not in the list is ignored without a reply. Usernames are case-insensitive and may include or omit `@`.
+- `google_drive_folder_id` is optional.
 
 ## Option A: per-user OAuth consent flow
 
@@ -49,17 +58,27 @@ Use this mode when multiple users should connect their own Google Drive accounts
    https://your-domain.example/oauth2/callback
    ```
 
-3. Export OAuth settings:
+3. Configure OAuth in JSON:
 
-   ```bash
-   export GOOGLE_OAUTH_CLIENT_ID='google-client-id.apps.googleusercontent.com'
-   export GOOGLE_OAUTH_CLIENT_SECRET='google-client-secret'
-   export GOOGLE_OAUTH_REDIRECT_URI='https://your-domain.example/oauth2/callback'
-   export OAUTH_BIND_ADDR='0.0.0.0:8080'
-   export GOOGLE_OAUTH_TOKENS_FILE='./google-oauth-tokens.json'
+   ```json
+   {
+     "telegram_token": "123456:telegram-token",
+     "allowed_telegram_usernames": ["alice", "@bob"],
+     "google_drive_folder_id": "optional-folder-id",
+     "oauth_server": {
+       "bind_addr": "0.0.0.0:8080"
+     },
+     "google": {
+       "mode": "oauth",
+       "client_id": "google-client-id.apps.googleusercontent.com",
+       "client_secret": "google-client-secret",
+       "redirect_uri": "https://your-domain.example/oauth2/callback",
+       "tokens_file": "./google-oauth-tokens.json"
+     }
+   }
    ```
 
-4. Run the bot and tell each allowed user to send `/auth`. The bot replies with a Google consent URL. After consent, tokens are stored by Telegram user id in `GOOGLE_OAUTH_TOKENS_FILE`, so each user's files upload to their own Drive.
+4. Run the bot and tell each allowed user to send `/auth`. The bot replies with a Google consent URL. After consent, tokens are stored by Telegram user id in `tokens_file`, so each user's files upload to their own Drive.
 
 ## Option B: service-account mode
 
@@ -69,23 +88,59 @@ Use this mode when all uploads should go to one service-account-accessible Drive
 
 2. Give that service account access to your Drive destination. For example, create or choose a Drive folder and share it with the service account `client_email`.
 
-3. Export the Google credentials either as raw JSON or as a file path:
+3. Configure service-account mode in JSON:
 
-   ```bash
-   export GOOGLE_SERVICE_ACCOUNT_FILE='/secure/path/service-account.json'
-   # or:
-   export GOOGLE_SERVICE_ACCOUNT_JSON="$(cat /secure/path/service-account.json)"
+   ```json
+   {
+     "telegram_token": "123456:telegram-token",
+     "allowed_telegram_usernames": ["alice", "@bob"],
+     "google_drive_folder_id": "optional-folder-id",
+     "google": {
+       "mode": "service_account",
+       "json_file": "/secure/path/service-account.json"
+     }
+   }
    ```
 
-OAuth mode is selected automatically when `GOOGLE_OAUTH_CLIENT_ID` is set. Otherwise, the bot falls back to service-account mode.
+   You can also use a `json` string field instead of `json_file`, but `json_file` is recommended so the main bot config stays readable.
 
-## Run
+## Run locally
 
 ```bash
-cargo run --release
+cp config.example.json config.json
+# edit config.json
+cargo run --release -- config.json
 ```
 
 Send `/help` to see the mode-specific instructions. In OAuth mode, send `/auth` before sending files. In service-account mode, send files directly.
+
+## Deploy as one executable plus one config file
+
+Download the Linux AMD64 release archive from GitHub Releases, then place the binary and config wherever you want:
+
+```bash
+tar -xzf telegram-drive-uploader-linux-amd64.tar.gz
+sudo install -m 0755 telegram-drive-uploader-linux-amd64 /usr/local/bin/telegram-drive-uploader
+sudo mkdir -p /etc/telegram-drive-uploader
+sudo cp config.example.json /etc/telegram-drive-uploader/config.json
+sudoedit /etc/telegram-drive-uploader/config.json
+telegram-drive-uploader /etc/telegram-drive-uploader/config.json
+```
+
+For OAuth mode, make sure your reverse proxy forwards the public `GOOGLE_OAUTH_REDIRECT_URI` equivalent from the JSON config to the configured `oauth_server.bind_addr`.
+
+## GitHub Actions release workflow
+
+The workflow at `.github/workflows/release.yml` builds `x86_64-unknown-linux-gnu` with `cargo build --release --locked`, packages the binary plus example configs, uploads a workflow artifact, and publishes the archive on tag pushes matching `v*`.
+
+To publish a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+You can also run the workflow manually from GitHub Actions to get an artifact without publishing a GitHub Release.
 
 ## Notes for large files
 
