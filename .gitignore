@@ -1,0 +1,6 @@
+/target/
+.env
+*.pem
+service-account*.json
+
+google-oauth-tokens.json
