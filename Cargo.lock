@@ -1595,6 +1595,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-util",
+ "reqwest 0.11.27",
  "reqwest 0.12.28",
  "ring",
  "serde",
