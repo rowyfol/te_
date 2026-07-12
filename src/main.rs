@@ -395,7 +395,8 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
         .await
         .context("failed to get Telegram file metadata")?;
     let total_size = file.size as u64;
-    let telegram_stream = telegram_file_stream(&state.telegram_http, bot.token(), &file.path).await?;
+    let telegram_stream =
+        telegram_file_stream(&state.telegram_http, bot.token(), &file.path).await?;
     let uploaded = state
         .drive
         .upload_stream(
@@ -780,7 +781,9 @@ impl DriveClient {
         let status = response.status();
         if !status.is_success() {
             let err_text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("failed to create Drive resumable upload session: HTTP {status} - {err_text}"));
+            return Err(anyhow!(
+                "failed to create Drive resumable upload session: HTTP {status} - {err_text}"
+            ));
         }
 
         response
@@ -812,7 +815,9 @@ impl DriveClient {
             Ok(())
         } else {
             let err_text = response.text().await.unwrap_or_default();
-            Err(anyhow!("Drive chunk upload failed with status {status} - {err_text}"))
+            Err(anyhow!(
+                "Drive chunk upload failed with status {status} - {err_text}"
+            ))
         }
     }
 
@@ -847,7 +852,9 @@ impl DriveClient {
         let status = response.status();
         if !status.is_success() {
             let err_text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Drive final chunk upload failed: HTTP {status} - {err_text}"));
+            return Err(anyhow!(
+                "Drive final chunk upload failed: HTTP {status} - {err_text}"
+            ));
         }
 
         response
