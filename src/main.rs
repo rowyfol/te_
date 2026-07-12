@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 use uuid::Uuid;
 
-const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
+const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const RESUMABLE_UPLOAD_URL: &str = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,webViewLink";
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // Google resumable uploads require multiples of 256 KiB.
@@ -755,8 +755,14 @@ impl DriveClient {
             .json(&metadata)
             .send()
             .await
-            .context("failed to create Drive resumable upload session")?
-            .error_for_status()?;
+            .context("failed to create Drive resumable upload session")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("failed to create Drive resumable upload session: HTTP {status} - {err_text}"));
+        }
+
         response
             .headers()
             .get(header::LOCATION)
@@ -767,7 +773,7 @@ impl DriveClient {
 
     async fn put_chunk(&self, session: &str, start: u64, total: u64, bytes: Vec<u8>) -> Result<()> {
         let end = start + bytes.len() as u64 - 1;
-        let status = self
+        let response = self
             .http
             .put(session)
             .header(header::CONTENT_LENGTH, bytes.len())
@@ -777,15 +783,16 @@ impl DriveClient {
             )
             .body(bytes)
             .send()
-            .await?
-            .status();
+            .await?;
+        let status = response.status();
         if status == StatusCode::PERMANENT_REDIRECT
             || status == StatusCode::OK
             || status == StatusCode::CREATED
         {
             Ok(())
         } else {
-            Err(anyhow!("Drive chunk upload failed with status {status}"))
+            let err_text = response.text().await.unwrap_or_default();
+            Err(anyhow!("Drive chunk upload failed with status {status} - {err_text}"))
         }
     }
 
@@ -816,8 +823,14 @@ impl DriveClient {
                 .send()
                 .await?
         };
+
+        let status = response.status();
+        if !status.is_success() {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Drive final chunk upload failed: HTTP {status} - {err_text}"));
+        }
+
         response
-            .error_for_status()?
             .json()
             .await
             .context("failed to parse Drive upload response")
