@@ -11,7 +11,7 @@ A resource-efficient Telegram bot written with [`teloxide`](https://github.com/t
 - Reuses one `reqwest::Client` for connection pooling.
 - Supports two Google Drive authentication modes:
   - **Per-user OAuth:** each allowed Telegram user runs `/auth`, opens a Google consent page, and uploads go to that user's Drive.
-  - **Service account:** all uploads go to a service-account-accessible Drive destination.
+  - **Service account:** uploads go to a shared-drive folder or (with domain-wide delegation) a delegated Workspace user's Drive.
 - Supports multiple Telegram users with separate OAuth token storage.
 - Supports an optional Telegram username allow-list; disallowed users are ignored completely.
 - Supports an optional destination Drive folder.
@@ -92,11 +92,13 @@ Use this mode when multiple users should connect their own Google Drive accounts
 
 ## Option B: service-account mode
 
-Use this mode when all uploads should go to one service-account-accessible Drive folder.
+Use this mode when uploads should use one service account identity.
 
 1. Create a Google Cloud service account, enable the Google Drive API, and download the service-account JSON key.
 
-2. Give that service account access to your Drive destination. For example, create or choose a Drive folder and share it with the service account `client_email`.
+2. Choose one destination strategy:
+   - **Shared Drive folder (recommended):** create or choose a folder in a Shared Drive and share it with the service account `client_email`, then set `google_drive_folder_id`.
+   - **Workspace domain-wide delegation:** configure domain-wide delegation for the service account and set `google.delegated_user` to a user in your Workspace domain.
 
 3. Configure service-account mode in JSON:
 
@@ -104,15 +106,16 @@ Use this mode when all uploads should go to one service-account-accessible Drive
    {
      "telegram_token": "123456:telegram-token",
      "allowed_telegram_usernames": ["alice", "@bob"],
-     "google_drive_folder_id": "optional-folder-id",
+     "google_drive_folder_id": "shared-drive-folder-id",
      "google": {
        "mode": "service_account",
-       "json_file": "/secure/path/service-account.json"
+       "json_file": "/secure/path/service-account.json",
+       "delegated_user": "optional-user@your-workspace-domain.com"
      }
    }
    ```
 
-   You can also use a `json` string field instead of `json_file`, but `json_file` is recommended so the main bot config stays readable.
+   You can also use a `json` string field instead of `json_file`, but `json_file` is recommended so the main bot config stays readable. If you do not set `google.delegated_user`, set `google_drive_folder_id` to a Shared Drive folder ID.
 
 ## Run locally
 
