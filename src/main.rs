@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const RESUMABLE_UPLOAD_URL: &str = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,webViewLink";
+const RESUMABLE_UPLOAD_URL: &str = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,webViewLink&supportsAllDrives=true";
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // Google resumable uploads require multiples of 256 KiB.
 
 #[derive(Clone)]
@@ -92,6 +92,8 @@ enum GoogleConfig {
         json_file: Option<PathBuf>,
         #[serde(default)]
         json: Option<String>,
+        #[serde(default)]
+        delegated_user: Option<String>,
     },
 }
 
@@ -187,6 +189,7 @@ struct AccessToken {
 enum DriveAuth {
     ServiceAccount {
         key: ServiceAccountKey,
+        delegated_user: Option<String>,
         token: Mutex<Option<AccessToken>>,
     },
     OAuth {
@@ -232,6 +235,8 @@ struct Claims<'a> {
     iss: &'a str,
     scope: &'a str,
     aud: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<&'a str>,
     exp: u64,
     iat: u64,
 }
@@ -584,7 +589,11 @@ impl DriveClient {
                     pending_states: Mutex::new(HashMap::new()),
                 }
             }
-            GoogleConfig::ServiceAccount { json_file, json } => {
+            GoogleConfig::ServiceAccount {
+                json_file,
+                json,
+                delegated_user,
+            } => {
                 let key_json = match (json, json_file) {
                     (Some(raw), _) if !raw.is_empty() => raw.clone(),
                     (_, Some(path)) => {
@@ -598,9 +607,20 @@ impl DriveClient {
                         ))
                     }
                 };
+                let delegated_user = delegated_user
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                if folder_id.is_none() && delegated_user.is_none() {
+                    return Err(anyhow!(
+                        "service_account mode requires google_drive_folder_id (shared-drive folder) or google.delegated_user (workspace delegation)"
+                    ));
+                }
                 DriveAuth::ServiceAccount {
                     key: serde_json::from_str(&key_json)
                         .context("invalid Google service-account JSON")?,
+                    delegated_user,
                     token: Mutex::new(None),
                 }
             }
@@ -838,14 +858,20 @@ impl DriveClient {
 
     async fn access_token(&self, telegram_user_id: u64) -> Result<String> {
         match &self.auth {
-            DriveAuth::ServiceAccount { key, token } => {
+            DriveAuth::ServiceAccount {
+                key,
+                delegated_user,
+                token,
+            } => {
                 let now = Instant::now();
                 if let Some(token) = token.lock().await.as_ref() {
                     if token.expires_at > now + Duration::from_secs(60) {
                         return Ok(token.value.clone());
                     }
                 }
-                let fresh = self.fetch_service_account_access_token(key).await?;
+                let fresh = self
+                    .fetch_service_account_access_token(key, delegated_user.as_deref())
+                    .await?;
                 let value = fresh.value.clone();
                 *token.lock().await = Some(fresh);
                 Ok(value)
@@ -879,8 +905,9 @@ impl DriveClient {
     async fn fetch_service_account_access_token(
         &self,
         key: &ServiceAccountKey,
+        delegated_user: Option<&str>,
     ) -> Result<AccessToken> {
-        let assertion = self.signed_jwt(key)?;
+        let assertion = self.signed_jwt(key, delegated_user)?;
         let response: TokenResponse = self
             .http
             .post(&key.token_uri)
@@ -935,7 +962,7 @@ impl DriveClient {
         })
     }
 
-    fn signed_jwt(&self, key: &ServiceAccountKey) -> Result<String> {
+    fn signed_jwt(&self, key: &ServiceAccountKey, delegated_user: Option<&str>) -> Result<String> {
         let iat = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -944,6 +971,7 @@ impl DriveClient {
             iss: &key.client_email,
             scope: DRIVE_SCOPE,
             aud: &key.token_uri,
+            sub: delegated_user,
             iat,
             exp: iat + 3600,
         };
