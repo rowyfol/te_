@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -349,17 +349,60 @@ async fn oauth_callback_inner(
 
 async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
     if let Some(text) = msg.text() {
-        if text == "/start" || text == "/help" {
+        let trimmed = text.trim();
+        if trimmed == "/start" || trimmed == "/help" {
             bot.send_message(msg.chat.id, help_text(state.drive.uses_oauth()))
                 .await?;
             return Ok(());
         }
-        if text == "/auth" {
+        if trimmed == "/auth" {
             let user_id = telegram_user_id(&msg).context("could not identify Telegram user")?;
             let url = state.drive.authorization_url(user_id, msg.chat.id).await?;
             bot.send_message(
                 msg.chat.id,
                 format!("Open this URL to connect Google Drive:\n{url}"),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if let Some(url) = extract_direct_link(trimmed) {
+            let user_id = telegram_user_id(&msg).context("could not identify Telegram user")?;
+            if state.drive.uses_oauth() && !state.drive.has_oauth_token(user_id).await {
+                let auth_url = state.drive.authorization_url(user_id, msg.chat.id).await?;
+                bot.send_message(
+                    msg.chat.id,
+                    format!("Please connect Google Drive first:\n{auth_url}"),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let parsed_url = validate_direct_url(url)?;
+            bot.send_message(msg.chat.id, "Fetching direct link and uploading to Google Drive…")
+                .await?;
+            let (name, mime_type, total_size, stream) =
+                direct_url_stream(&state.telegram_http, parsed_url).await?;
+            let uploaded = state
+                .drive
+                .upload_stream(user_id, &name, mime_type.as_deref(), total_size, stream)
+                .await?;
+            let link = uploaded
+                .web_view_link
+                .unwrap_or_else(|| format!("https://drive.google.com/file/d/{}/view", uploaded.id));
+            let uploaded_size = uploaded
+                .size
+                .as_deref()
+                .and_then(|size| size.parse::<u64>().ok())
+                .map(format_bytes)
+                .unwrap_or_else(|| format_bytes(total_size));
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "Uploaded from URL: {} ({uploaded_size})\n{}",
+                    uploaded.name.unwrap_or(name),
+                    link
+                ),
             )
             .await?;
             return Ok(());
@@ -430,9 +473,9 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
 
 fn help_text(oauth_enabled: bool) -> &'static str {
     if oauth_enabled {
-        "Send /auth to connect your Google Drive, then send me files to upload."
+        "Send /auth to connect your Google Drive, then send files or /url <https://...> to upload."
     } else {
-        "Send me files and I will upload them to the configured Google Drive service-account destination."
+        "Send files or /url <https://...> and I will upload them to the configured Google Drive destination."
     }
 }
 
@@ -564,6 +607,106 @@ async fn telegram_file_stream(
         .context("failed to start Telegram file download")?
         .error_for_status()?;
     Ok(response.bytes_stream())
+}
+
+fn extract_direct_link(text: &str) -> Option<&str> {
+    let mut parts = text.split_whitespace();
+    let first = parts.next()?;
+    if is_command(first, "url") || is_command(first, "link") {
+        return parts.next();
+    }
+
+    if text.starts_with("http://") || text.starts_with("https://") {
+        return Some(text);
+    }
+    None
+}
+
+fn is_command(token: &str, command: &str) -> bool {
+    token
+        .strip_prefix('/')
+        .and_then(|value| value.split('@').next())
+        .is_some_and(|value| value.eq_ignore_ascii_case(command))
+}
+
+fn validate_direct_url(raw: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).context("invalid URL format")?;
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return Err(anyhow!("URL must use http:// or https://")),
+    }
+    let host = url.host_str().context("URL host is missing")?;
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return Err(anyhow!("localhost URLs are not allowed"));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if blocked_ip(ip) {
+            return Err(anyhow!("private or local IP URLs are not allowed"));
+        }
+    }
+    Ok(url)
+}
+
+fn blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_private()
+                || ipv4.is_loopback()
+                || ipv4.is_link_local()
+                || ipv4.is_multicast()
+                || ipv4.is_broadcast()
+                || ipv4.is_unspecified()
+                || ipv4.is_documentation()
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                || ipv6.is_multicast()
+                || ipv6.is_unique_local()
+                || ipv6.is_unicast_link_local()
+        }
+    }
+}
+
+async fn direct_url_stream(
+    client: &Client,
+    url: reqwest::Url,
+) -> Result<(
+    String,
+    Option<String>,
+    u64,
+    impl Stream<Item = reqwest::Result<bytes::Bytes>>,
+)> {
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .context("failed to start direct-link download")?
+        .error_for_status()
+        .context("direct-link request failed")?;
+    let total_size = response
+        .content_length()
+        .context("direct link must include Content-Length header")?;
+    if total_size == 0 {
+        return Err(anyhow!("direct link returned empty content"));
+    }
+    let mime_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let filename = filename_from_url(&url);
+    Ok((filename, mime_type, total_size, response.bytes_stream()))
+}
+
+fn filename_from_url(url: &reqwest::Url) -> String {
+    url.path_segments()
+        .and_then(|segments| segments.last())
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_owned())
+        .unwrap_or_else(|| "download.bin".to_owned())
 }
 
 impl DriveClient {

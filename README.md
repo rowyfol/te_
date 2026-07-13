@@ -6,6 +6,7 @@ A resource-efficient Telegram bot written with [`teloxide`](https://github.com/t
 
 - One constant Linux executable plus one JSON config file for deployment.
 - Accepts documents, videos, audio, voice messages, and photos.
+- Accepts direct HTTP/HTTPS links via `/url <link>` (or by sending a raw link message).
 - Downloads from Telegram as an async byte stream.
 - Uploads to Google Drive in 8 MiB resumable chunks, so files are never fully buffered in RAM or written to disk.
 - Reuses one `reqwest::Client` for connection pooling.
@@ -125,7 +126,7 @@ cp config.example.json config.json
 cargo run --release -- config.json
 ```
 
-Send `/help` to see the mode-specific instructions. In OAuth mode, send `/auth` before sending files. In service-account mode, send files directly.
+Send `/help` to see the mode-specific instructions. In OAuth mode, send `/auth` before sending files or `/url <link>`. In service-account mode, send files or direct links directly.
 
 ## Deploy as one executable plus one config file
 
