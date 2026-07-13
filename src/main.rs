@@ -14,9 +14,12 @@ use axum::{
     routing::get,
     Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use futures_util::{Stream, StreamExt};
-use reqwest::{header, Client, StatusCode};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
+use futures_util::{Stream, StreamExt, TryStreamExt};
+use reqwest::{header, Body, Client, StatusCode};
 use reqwest_011::{Client as TelegramApiClient, Proxy as TelegramApiProxy};
 use ring::signature::RsaKeyPair;
 use serde::{Deserialize, Serialize};
@@ -37,7 +40,7 @@ const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // Google resumable uploads require mul
 #[derive(Clone)]
 struct AppState {
     telegram_http: Client,
-    drive: Arc<DriveClient>,
+    storage: Arc<StorageClient>,
     access: Arc<AccessControl>,
 }
 
@@ -48,7 +51,10 @@ struct Config {
     allowed_telegram_usernames: Vec<String>,
     #[serde(default)]
     google_drive_folder_id: Option<String>,
-    google: GoogleConfig,
+    #[serde(default)]
+    storage: Option<StorageConfig>,
+    #[serde(default)]
+    google: Option<GoogleConfig>,
     #[serde(default)]
     oauth_server: OAuthServerConfig,
     #[serde(default)]
@@ -63,6 +69,8 @@ struct ProxyConfig {
     telegram_receive: Option<String>,
     #[serde(default)]
     google_drive: Option<String>,
+    #[serde(default)]
+    b2: Option<String>,
 }
 
 impl ProxyConfig {
@@ -74,6 +82,33 @@ impl ProxyConfig {
     fn google_drive(&self) -> Option<&str> {
         normalized_proxy(self.google_drive.as_ref()).or_else(|| normalized_proxy(self.all.as_ref()))
     }
+
+    fn b2(&self) -> Option<&str> {
+        normalized_proxy(self.b2.as_ref()).or_else(|| normalized_proxy(self.all.as_ref()))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+enum StorageConfig {
+    GoogleDrive {
+        #[serde(default)]
+        folder_id: Option<String>,
+        google: GoogleConfig,
+    },
+    B2 {
+        key_id: String,
+        application_key: String,
+        bucket_id: String,
+        #[serde(default)]
+        file_prefix: Option<String>,
+        #[serde(default = "default_b2_part_size")]
+        recommended_part_size: u64,
+    },
+}
+
+fn default_b2_part_size() -> u64 {
+    100 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -186,6 +221,296 @@ struct AccessToken {
 }
 
 #[derive(Debug)]
+enum StorageClient {
+    GoogleDrive(Arc<DriveClient>),
+    B2(B2Client),
+}
+
+#[derive(Debug)]
+struct UploadedFile {
+    name: Option<String>,
+    size: Option<u64>,
+    link: Option<String>,
+}
+
+#[derive(Debug)]
+struct B2Client {
+    http: Client,
+    key_id: String,
+    application_key: String,
+    bucket_id: String,
+    file_prefix: Option<String>,
+    recommended_part_size: u64,
+    auth: Mutex<Option<B2Auth>>,
+    upload: Mutex<Option<B2UploadUrl>>,
+}
+
+#[derive(Debug, Clone)]
+struct B2Auth {
+    authorization_token: String,
+    api_url: String,
+    download_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct B2AuthorizeResponse {
+    authorization_token: String,
+    api_url: String,
+    download_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct B2UploadUrl {
+    upload_url: String,
+    authorization_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct B2UploadResponse {
+    file_name: String,
+    content_length: u64,
+}
+
+impl StorageClient {
+    async fn from_config(google_http: Client, b2_http: Client, config: &Config) -> Result<Self> {
+        let storage = match (&config.storage, &config.google) {
+            (Some(storage), _) => storage.clone(),
+            (None, Some(google)) => StorageConfig::GoogleDrive {
+                folder_id: config.google_drive_folder_id.clone(),
+                google: google.clone(),
+            },
+            (None, None) => {
+                return Err(anyhow!(
+                    "config requires either storage or legacy google section"
+                ))
+            }
+        };
+
+        match storage {
+            StorageConfig::GoogleDrive { folder_id, google } => {
+                let drive_config = Config {
+                    telegram_token: config.telegram_token.clone(),
+                    allowed_telegram_usernames: config.allowed_telegram_usernames.clone(),
+                    google_drive_folder_id: folder_id
+                        .or_else(|| config.google_drive_folder_id.clone()),
+                    storage: None,
+                    google: Some(google),
+                    oauth_server: config.oauth_server.clone(),
+                    proxy: config.proxy.clone(),
+                };
+                Ok(Self::GoogleDrive(Arc::new(
+                    DriveClient::from_config(google_http, &drive_config).await?,
+                )))
+            }
+            StorageConfig::B2 {
+                key_id,
+                application_key,
+                bucket_id,
+                file_prefix,
+                recommended_part_size,
+            } => Ok(Self::B2(B2Client {
+                http: b2_http,
+                key_id,
+                application_key,
+                bucket_id,
+                file_prefix: file_prefix.and_then(|p| normalize_b2_prefix(&p)),
+                recommended_part_size,
+                auth: Mutex::new(None),
+                upload: Mutex::new(None),
+            })),
+        }
+    }
+
+    fn drive(&self) -> Option<Arc<DriveClient>> {
+        match self {
+            Self::GoogleDrive(drive) => Some(drive.clone()),
+            Self::B2(_) => None,
+        }
+    }
+
+    fn uses_oauth(&self) -> bool {
+        matches!(self, Self::GoogleDrive(drive) if drive.uses_oauth())
+    }
+
+    async fn has_oauth_token(&self, telegram_user_id: u64) -> bool {
+        match self {
+            Self::GoogleDrive(drive) => drive.has_oauth_token(telegram_user_id).await,
+            Self::B2(_) => true,
+        }
+    }
+
+    async fn authorization_url(&self, telegram_user_id: u64, chat_id: ChatId) -> Result<String> {
+        match self {
+            Self::GoogleDrive(drive) => drive.authorization_url(telegram_user_id, chat_id).await,
+            Self::B2(_) => Err(anyhow!("/auth is only used by Google Drive OAuth mode")),
+        }
+    }
+
+    async fn upload_stream<S>(
+        &self,
+        telegram_user_id: u64,
+        name: &str,
+        mime_type: Option<&str>,
+        total_size: u64,
+        stream: S,
+    ) -> Result<UploadedFile>
+    where
+        S: Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin + Send + 'static,
+    {
+        match self {
+            Self::GoogleDrive(drive) => {
+                let file = drive
+                    .upload_stream(telegram_user_id, name, mime_type, total_size, stream)
+                    .await?;
+                Ok(UploadedFile {
+                    name: file.name,
+                    size: file.size.and_then(|s| s.parse::<u64>().ok()),
+                    link: file.web_view_link.or_else(|| {
+                        Some(format!("https://drive.google.com/file/d/{}/view", file.id))
+                    }),
+                })
+            }
+            Self::B2(b2) => b2.upload_stream(name, mime_type, total_size, stream).await,
+        }
+    }
+}
+
+impl B2Client {
+    async fn upload_stream<S>(
+        &self,
+        name: &str,
+        mime_type: Option<&str>,
+        total_size: u64,
+        stream: S,
+    ) -> Result<UploadedFile>
+    where
+        S: Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin + Send + 'static,
+    {
+        if total_size > 5 * 1024 * 1024 * 1024 {
+            return Err(anyhow!(
+                "B2 single-call streaming uploads are limited to 5 GiB; configure Telegram/direct-link limits below that or add multipart upload support with at least {} buffering",
+                format_bytes(self.recommended_part_size)
+            ));
+        }
+        let auth = self.authorize().await?;
+        let upload = self.upload_url(&auth).await?;
+        let file_name = self.b2_file_name(name);
+        let body_stream = stream.map_err(std::io::Error::other);
+        let response = self
+            .http
+            .post(&upload.upload_url)
+            .header(header::AUTHORIZATION, upload.authorization_token)
+            .header("X-Bz-File-Name", percent_encode_b2_name(&file_name))
+            .header(header::CONTENT_TYPE, mime_type.unwrap_or("b2/x-auto"))
+            .header(header::CONTENT_LENGTH, total_size)
+            .header("X-Bz-Content-Sha1", "do_not_verify")
+            .body(Body::wrap_stream(body_stream))
+            .send()
+            .await
+            .context("failed to upload stream to Backblaze B2")?;
+        let status = response.status();
+        if !status.is_success() {
+            *self.upload.lock().await = None;
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("B2 upload failed: HTTP {status} - {err_text}"));
+        }
+        let uploaded: B2UploadResponse = response
+            .json()
+            .await
+            .context("failed to parse B2 upload response")?;
+        Ok(UploadedFile {
+            name: Some(uploaded.file_name.clone()),
+            size: Some(uploaded.content_length),
+            link: Some(format!(
+                "{}/file/{}/{}",
+                auth.download_url,
+                self.bucket_id,
+                percent_encode_b2_name(&uploaded.file_name)
+            )),
+        })
+    }
+
+    async fn authorize(&self) -> Result<B2Auth> {
+        if let Some(auth) = self.auth.lock().await.clone() {
+            return Ok(auth);
+        }
+        let basic = STANDARD.encode(format!("{}:{}", self.key_id, self.application_key));
+        let response = self
+            .http
+            .get("https://api.backblazeb2.com/b2api/v2/b2_authorize_account")
+            .header(header::AUTHORIZATION, format!("Basic {basic}"))
+            .send()
+            .await
+            .context("failed to authorize Backblaze B2 account")?;
+        let status = response.status();
+        if !status.is_success() {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "B2 authorization failed: HTTP {status} - {err_text}"
+            ));
+        }
+        let raw: B2AuthorizeResponse = response
+            .json()
+            .await
+            .context("failed to parse B2 authorization response")?;
+        let auth = B2Auth {
+            authorization_token: raw.authorization_token,
+            api_url: raw.api_url,
+            download_url: raw.download_url,
+        };
+        *self.auth.lock().await = Some(auth.clone());
+        Ok(auth)
+    }
+
+    async fn upload_url(&self, auth: &B2Auth) -> Result<B2UploadUrl> {
+        if let Some(upload) = self.upload.lock().await.clone() {
+            return Ok(upload);
+        }
+        let response = self
+            .http
+            .post(format!("{}/b2api/v2/b2_get_upload_url", auth.api_url))
+            .bearer_auth(&auth.authorization_token)
+            .json(&json!({ "bucketId": self.bucket_id }))
+            .send()
+            .await
+            .context("failed to request Backblaze B2 upload URL")?;
+        let status = response.status();
+        if !status.is_success() {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "B2 get upload URL failed: HTTP {status} - {err_text}"
+            ));
+        }
+        let upload: B2UploadUrl = response
+            .json()
+            .await
+            .context("failed to parse B2 upload URL response")?;
+        *self.upload.lock().await = Some(upload.clone());
+        Ok(upload)
+    }
+
+    fn b2_file_name(&self, name: &str) -> String {
+        let safe = name.trim().trim_start_matches('/');
+        match &self.file_prefix {
+            Some(prefix) => format!("{prefix}/{safe}"),
+            None => safe.to_owned(),
+        }
+    }
+}
+
+fn normalize_b2_prefix(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim().trim_matches('/');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn percent_encode_b2_name(name: &str) -> String {
+    urlencoding::encode(name).replace("%2F", "/")
+}
+
+#[derive(Debug)]
 enum DriveAuth {
     ServiceAccount {
         key: ServiceAccountKey,
@@ -267,21 +592,24 @@ async fn run() -> Result<()> {
     let config = load_config().await?;
     let telegram_http = build_http_client(config.proxy.telegram_receive())?;
     let telegram_api_http = build_telegram_api_client(config.proxy.telegram_receive())?;
-    let drive_http = build_http_client(config.proxy.google_drive())?;
+    let google_http = build_http_client(config.proxy.google_drive())?;
+    let b2_http = build_http_client(config.proxy.b2())?;
     let bot = Bot::with_client(config.telegram_token.clone(), telegram_api_http);
-    let drive = Arc::new(DriveClient::from_config(drive_http, &config).await?);
+    let storage = Arc::new(StorageClient::from_config(google_http, b2_http, &config).await?);
 
-    if drive.uses_oauth() {
-        spawn_oauth_server(bot.clone(), drive.clone(), config.oauth_server.bind_addr).await?;
+    if let Some(drive) = storage.drive() {
+        if drive.uses_oauth() {
+            spawn_oauth_server(bot.clone(), drive.clone(), config.oauth_server.bind_addr).await?;
+        }
     }
 
     let state = AppState {
         telegram_http,
-        drive,
+        storage,
         access: Arc::new(AccessControl::from_config(&config)),
     };
 
-    info!("starting Telegram → Google Drive uploader bot");
+    info!("starting Telegram uploader bot");
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let state = state.clone();
         async move {
@@ -351,13 +679,16 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
     if let Some(text) = msg.text() {
         let trimmed = text.trim();
         if trimmed == "/start" || trimmed == "/help" {
-            bot.send_message(msg.chat.id, help_text(state.drive.uses_oauth()))
+            bot.send_message(msg.chat.id, help_text(&state.storage))
                 .await?;
             return Ok(());
         }
         if trimmed == "/auth" {
             let user_id = telegram_user_id(&msg).context("could not identify Telegram user")?;
-            let url = state.drive.authorization_url(user_id, msg.chat.id).await?;
+            let url = state
+                .storage
+                .authorization_url(user_id, msg.chat.id)
+                .await?;
             bot.send_message(
                 msg.chat.id,
                 format!("Open this URL to connect Google Drive:\n{url}"),
@@ -368,8 +699,11 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
 
         if let Some(url) = extract_direct_link(trimmed) {
             let user_id = telegram_user_id(&msg).context("could not identify Telegram user")?;
-            if state.drive.uses_oauth() && !state.drive.has_oauth_token(user_id).await {
-                let auth_url = state.drive.authorization_url(user_id, msg.chat.id).await?;
+            if state.storage.uses_oauth() && !state.storage.has_oauth_token(user_id).await {
+                let auth_url = state
+                    .storage
+                    .authorization_url(user_id, msg.chat.id)
+                    .await?;
                 bot.send_message(
                     msg.chat.id,
                     format!("Please connect Google Drive first:\n{auth_url}"),
@@ -379,23 +713,21 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
             }
 
             let parsed_url = validate_direct_url(url)?;
-            bot.send_message(msg.chat.id, "Fetching direct link and uploading to Google Drive…")
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                "Fetching direct link and uploading to configured storage…",
+            )
+            .await?;
             let (name, mime_type, total_size, stream) =
                 direct_url_stream(&state.telegram_http, parsed_url).await?;
             let uploaded = state
-                .drive
+                .storage
                 .upload_stream(user_id, &name, mime_type.as_deref(), total_size, stream)
                 .await?;
             let link = uploaded
-                .web_view_link
-                .unwrap_or_else(|| format!("https://drive.google.com/file/d/{}/view", uploaded.id));
-            let uploaded_size = uploaded
-                .size
-                .as_deref()
-                .and_then(|size| size.parse::<u64>().ok())
-                .map(format_bytes)
-                .unwrap_or_else(|| format_bytes(total_size));
+                .link
+                .unwrap_or_else(|| "No public link returned".to_owned());
+            let uploaded_size = format_bytes(uploaded.size.unwrap_or(total_size));
             bot.send_message(
                 msg.chat.id,
                 format!(
@@ -418,8 +750,11 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
         return Ok(());
     };
     let user_id = telegram_user_id(&msg).context("could not identify Telegram user")?;
-    if state.drive.uses_oauth() && !state.drive.has_oauth_token(user_id).await {
-        let url = state.drive.authorization_url(user_id, msg.chat.id).await?;
+    if state.storage.uses_oauth() && !state.storage.has_oauth_token(user_id).await {
+        let url = state
+            .storage
+            .authorization_url(user_id, msg.chat.id)
+            .await?;
         bot.send_message(
             msg.chat.id,
             format!("Please connect Google Drive first:\n{url}"),
@@ -430,7 +765,7 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
 
     bot.send_message(
         msg.chat.id,
-        format!("Uploading {} to Google Drive…", incoming.name),
+        format!("Uploading {} to configured storage…", incoming.name),
     )
     .await?;
     let file = bot
@@ -441,7 +776,7 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
     let telegram_stream =
         telegram_file_stream(&state.telegram_http, bot.token(), &file.path).await?;
     let uploaded = state
-        .drive
+        .storage
         .upload_stream(
             user_id,
             &incoming.name,
@@ -451,14 +786,9 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
         )
         .await?;
     let link = uploaded
-        .web_view_link
-        .unwrap_or_else(|| format!("https://drive.google.com/file/d/{}/view", uploaded.id));
-    let uploaded_size = uploaded
-        .size
-        .as_deref()
-        .and_then(|size| size.parse::<u64>().ok())
-        .map(format_bytes)
-        .unwrap_or_else(|| format_bytes(total_size));
+        .link
+        .unwrap_or_else(|| "No public link returned".to_owned());
+    let uploaded_size = format_bytes(uploaded.size.unwrap_or(total_size));
     bot.send_message(
         msg.chat.id,
         format!(
@@ -471,11 +801,17 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
     Ok(())
 }
 
-fn help_text(oauth_enabled: bool) -> &'static str {
-    if oauth_enabled {
-        "Send /auth to connect your Google Drive, then send files or /url <https://...> to upload."
-    } else {
-        "Send files or /url <https://...> and I will upload them to the configured Google Drive destination."
+fn help_text(storage: &StorageClient) -> &'static str {
+    match storage {
+        StorageClient::GoogleDrive(drive) if drive.uses_oauth() => {
+            "Send /auth to connect your Google Drive, then send files or /url <https://...> to upload."
+        }
+        StorageClient::GoogleDrive(_) => {
+            "Send files or /url <https://...> and I will upload them to the configured Google Drive destination."
+        }
+        StorageClient::B2(_) => {
+            "Send files or /url <https://...> and I will upload them to the configured Backblaze B2 bucket."
+        }
     }
 }
 
@@ -716,7 +1052,11 @@ impl DriveClient {
             .as_ref()
             .filter(|s| !s.is_empty())
             .cloned();
-        let auth = match &config.google {
+        let google = config
+            .google
+            .as_ref()
+            .context("Google Drive storage requires google config")?;
+        let auth = match google {
             GoogleConfig::OAuth {
                 client_id,
                 client_secret,
