@@ -1,0 +1,17 @@
+{
+  "telegram_token": "123456:telegram-token",
+  "allowed_telegram_usernames": ["alice", "@bob"],
+  "proxy": {
+    "all": "",
+    "telegram_receive": "",
+    "b2": ""
+  },
+  "storage": {
+    "provider": "b2",
+    "key_id": "backblaze-key-id",
+    "application_key": "backblaze-application-key",
+    "bucket_id": "backblaze-bucket-id",
+    "file_prefix": "telegram-uploads",
+    "recommended_part_size": 104857600
+  }
+}

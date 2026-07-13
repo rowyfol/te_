@@ -1,7 +1,6 @@
 {
   "telegram_token": "123456:telegram-token",
   "allowed_telegram_usernames": ["alice", "@bob"],
-  "google_drive_folder_id": "optional-folder-id",
   "proxy": {
     "all": "socks5h://127.0.0.1:1080",
     "telegram_receive": "",
@@ -10,11 +9,15 @@
   "oauth_server": {
     "bind_addr": "0.0.0.0:8080"
   },
-  "google": {
-    "mode": "oauth",
-    "client_id": "google-client-id.apps.googleusercontent.com",
-    "client_secret": "google-client-secret",
-    "redirect_uri": "https://your-domain.example/oauth2/callback",
-    "tokens_file": "./google-oauth-tokens.json"
+  "storage": {
+    "provider": "google_drive",
+    "folder_id": "optional-folder-id",
+    "google": {
+      "mode": "oauth",
+      "client_id": "google-client-id.apps.googleusercontent.com",
+      "client_secret": "google-client-secret",
+      "redirect_uri": "https://your-domain.example/oauth2/callback",
+      "tokens_file": "./google-oauth-tokens.json"
+    }
   }
 }
