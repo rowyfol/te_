@@ -472,7 +472,7 @@ impl B2Client {
         let response = self
             .http
             .post(format!("{}/b2api/v2/b2_get_upload_url", auth.api_url))
-            .bearer_auth(&auth.authorization_token)
+            .header(header::AUTHORIZATION, &auth.authorization_token)
             .json(&json!({ "bucketId": self.bucket_id }))
             .send()
             .await
