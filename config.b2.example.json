@@ -1,6 +1,18 @@
 {
   "telegram_token": "123456:telegram-token",
   "allowed_telegram_usernames": ["alice", "@bob"],
+  "admin_telegram_usernames": ["alice"],
+  "features": {
+    "telegram_bot": true,
+    "telegram_uploads": true,
+    "direct_url_uploads": true,
+    "google_drive_uploads": true,
+    "b2_uploads": true,
+    "bale_bot": false,
+    "telegram_to_bale": false,
+    "bale_to_telegram": false,
+    "admin_config_reload": true
+  },
   "proxy": {
     "all": "",
     "telegram_receive": "",
@@ -11,6 +23,7 @@
     "key_id": "backblaze-key-id",
     "application_key": "backblaze-application-key",
     "bucket_id": "backblaze-bucket-id",
+    "bucket_name": "ashbox",
     "file_prefix": "telegram-uploads",
     "recommended_part_size": 104857600
   }

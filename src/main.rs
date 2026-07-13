@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -14,14 +14,10 @@ use axum::{
     routing::get,
     Router,
 };
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine as _,
-};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use reqwest::{header, Body, Client, StatusCode};
 use reqwest_011::{Client as TelegramApiClient, Proxy as TelegramApiProxy};
-use ring::signature::RsaKeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use teloxide::{
@@ -42,6 +38,7 @@ struct AppState {
     telegram_http: Client,
     storage: Arc<StorageClient>,
     access: Arc<AccessControl>,
+    runtime: Arc<RuntimeConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +46,12 @@ struct Config {
     telegram_token: String,
     #[serde(default)]
     allowed_telegram_usernames: Vec<String>,
+    #[serde(default)]
+    admin_telegram_usernames: Vec<String>,
+    #[serde(default)]
+    features: FeatureConfig,
+    #[serde(default)]
+    bale: Option<BaleConfig>,
     #[serde(default)]
     google_drive_folder_id: Option<String>,
     #[serde(default)]
@@ -59,6 +62,73 @@ struct Config {
     oauth_server: OAuthServerConfig,
     #[serde(default)]
     proxy: ProxyConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FeatureConfig {
+    #[serde(default = "default_true")]
+    telegram_bot: bool,
+    #[serde(default = "default_true")]
+    telegram_uploads: bool,
+    #[serde(default = "default_true")]
+    direct_url_uploads: bool,
+    #[serde(default = "default_true")]
+    google_drive_uploads: bool,
+    #[serde(default = "default_true")]
+    b2_uploads: bool,
+    #[serde(default)]
+    bale_bot: bool,
+    #[serde(default)]
+    telegram_to_bale: bool,
+    #[serde(default)]
+    bale_to_telegram: bool,
+    #[serde(default = "default_true")]
+    admin_config_reload: bool,
+}
+
+impl Default for FeatureConfig {
+    fn default() -> Self {
+        Self {
+            telegram_bot: true,
+            telegram_uploads: true,
+            direct_url_uploads: true,
+            google_drive_uploads: true,
+            b2_uploads: true,
+            bale_bot: false,
+            telegram_to_bale: false,
+            bale_to_telegram: false,
+            admin_config_reload: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BaleConfig {
+    token: String,
+    #[serde(default)]
+    target_chat_id: Option<i64>,
+}
+
+#[derive(Debug)]
+struct RuntimeConfig {
+    path: PathBuf,
+    current: Mutex<Config>,
+}
+
+impl RuntimeConfig {
+    async fn reload(&self) -> Result<()> {
+        let config = read_config_from_path(&self.path).await?;
+        *self.current.lock().await = config;
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> Config {
+        self.current.lock().await.clone()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -101,6 +171,8 @@ enum StorageConfig {
         application_key: String,
         bucket_id: String,
         #[serde(default)]
+        bucket_name: Option<String>,
+        #[serde(default)]
         file_prefix: Option<String>,
         #[serde(default = "default_b2_part_size")]
         recommended_part_size: u64,
@@ -121,14 +193,6 @@ enum GoogleConfig {
         redirect_uri: String,
         #[serde(default = "default_oauth_tokens_file")]
         tokens_file: PathBuf,
-    },
-    ServiceAccount {
-        #[serde(default)]
-        json_file: Option<PathBuf>,
-        #[serde(default)]
-        json: Option<String>,
-        #[serde(default)]
-        delegated_user: Option<String>,
     },
 }
 
@@ -154,20 +218,32 @@ fn default_oauth_tokens_file() -> PathBuf {
     PathBuf::from("google-oauth-tokens.json")
 }
 
-async fn load_config() -> Result<Config> {
-    let path = env::args()
+fn config_path() -> PathBuf {
+    env::args()
         .nth(1)
         .or_else(|| env::var("CONFIG_PATH").ok())
-        .unwrap_or_else(|| "config.json".to_owned());
-    let bytes = tokio::fs::read(&path)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config.json"))
+}
+
+async fn load_config() -> Result<(PathBuf, Config)> {
+    let path = config_path();
+    let config = read_config_from_path(&path).await?;
+    Ok((path, config))
+}
+
+async fn read_config_from_path(path: &PathBuf) -> Result<Config> {
+    let bytes = tokio::fs::read(path)
         .await
-        .with_context(|| format!("failed to read config file at {path}"))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON config at {path}"))
+        .with_context(|| format!("failed to read config file at {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid JSON config at {}", path.display()))
 }
 
 #[derive(Debug)]
 struct AccessControl {
     allowed_usernames: HashSet<String>,
+    admin_usernames: HashSet<String>,
 }
 
 impl AccessControl {
@@ -178,7 +254,24 @@ impl AccessControl {
             .map(|username| normalize_username(username))
             .filter(|username| !username.is_empty())
             .collect();
-        Self { allowed_usernames }
+        let admin_usernames = config
+            .admin_telegram_usernames
+            .iter()
+            .map(|username| normalize_username(username))
+            .filter(|username| !username.is_empty())
+            .collect();
+        Self {
+            allowed_usernames,
+            admin_usernames,
+        }
+    }
+
+    fn is_admin(&self, msg: &Message) -> bool {
+        msg.from
+            .as_ref()
+            .and_then(|user| user.username.as_deref())
+            .map(normalize_username)
+            .is_some_and(|username| self.admin_usernames.contains(&username))
     }
 
     fn is_allowed(&self, msg: &Message) -> bool {
@@ -195,29 +288,11 @@ impl AccessControl {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ServiceAccountKey {
-    client_email: String,
-    private_key: String,
-    #[serde(default = "default_token_uri")]
-    token_uri: String,
-}
-
-fn default_token_uri() -> String {
-    TOKEN_URL.to_owned()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedOAuthToken {
     access_token: String,
     refresh_token: String,
     expires_at_unix: u64,
-}
-
-#[derive(Debug)]
-struct AccessToken {
-    value: String,
-    expires_at: Instant,
 }
 
 #[derive(Debug)]
@@ -239,6 +314,7 @@ struct B2Client {
     key_id: String,
     application_key: String,
     bucket_id: String,
+    bucket_name: Option<String>,
     file_prefix: Option<String>,
     recommended_part_size: u64,
     auth: Mutex<Option<B2Auth>>,
@@ -294,6 +370,9 @@ impl StorageClient {
                 let drive_config = Config {
                     telegram_token: config.telegram_token.clone(),
                     allowed_telegram_usernames: config.allowed_telegram_usernames.clone(),
+                    admin_telegram_usernames: config.admin_telegram_usernames.clone(),
+                    features: config.features.clone(),
+                    bale: config.bale.clone(),
                     google_drive_folder_id: folder_id
                         .or_else(|| config.google_drive_folder_id.clone()),
                     storage: None,
@@ -309,6 +388,7 @@ impl StorageClient {
                 key_id,
                 application_key,
                 bucket_id,
+                bucket_name,
                 file_prefix,
                 recommended_part_size,
             } => Ok(Self::B2(B2Client {
@@ -316,6 +396,7 @@ impl StorageClient {
                 key_id,
                 application_key,
                 bucket_id,
+                bucket_name,
                 file_prefix: file_prefix.and_then(|p| normalize_b2_prefix(&p)),
                 recommended_part_size,
                 auth: Mutex::new(None),
@@ -427,8 +508,8 @@ impl B2Client {
             link: Some(format!(
                 "{}/file/{}/{}",
                 auth.download_url,
-                self.bucket_id,
-                percent_encode_b2_name(&uploaded.file_name)
+                self.bucket_name.as_deref().unwrap_or(&self.bucket_id),
+                percent_encode_b2_download_name(&uploaded.file_name)
             )),
         })
     }
@@ -510,13 +591,14 @@ fn percent_encode_b2_name(name: &str) -> String {
     urlencoding::encode(name).replace("%2F", "/")
 }
 
+fn percent_encode_b2_download_name(name: &str) -> String {
+    urlencoding::encode(name)
+        .replace("%2F", "/")
+        .replace("%20", "+")
+}
+
 #[derive(Debug)]
 enum DriveAuth {
-    ServiceAccount {
-        key: ServiceAccountKey,
-        delegated_user: Option<String>,
-        token: Mutex<Option<AccessToken>>,
-    },
     OAuth {
         client_id: String,
         client_secret: String,
@@ -555,17 +637,6 @@ struct DriveFile {
     web_view_link: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct Claims<'a> {
-    iss: &'a str,
-    scope: &'a str,
-    aud: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sub: Option<&'a str>,
-    exp: u64,
-    iat: u64,
-}
-
 #[derive(Debug, Deserialize)]
 struct OAuthCallback {
     code: Option<String>,
@@ -589,13 +660,18 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    let config = load_config().await?;
+    let (config_file, config) = load_config().await?;
     let telegram_http = build_http_client(config.proxy.telegram_receive())?;
     let telegram_api_http = build_telegram_api_client(config.proxy.telegram_receive())?;
     let google_http = build_http_client(config.proxy.google_drive())?;
     let b2_http = build_http_client(config.proxy.b2())?;
     let bot = Bot::with_client(config.telegram_token.clone(), telegram_api_http);
     let storage = Arc::new(StorageClient::from_config(google_http, b2_http, &config).await?);
+    ensure_enabled_storage(&config, &storage)?;
+    let runtime = Arc::new(RuntimeConfig {
+        path: config_file,
+        current: Mutex::new(config.clone()),
+    });
 
     if let Some(drive) = storage.drive() {
         if drive.uses_oauth() {
@@ -607,7 +683,24 @@ async fn run() -> Result<()> {
         telegram_http,
         storage,
         access: Arc::new(AccessControl::from_config(&config)),
+        runtime: runtime.clone(),
     };
+
+    if config.features.bale_bot {
+        if let Some(bale) = config.bale.clone() {
+            tokio::spawn(run_bale_bot(
+                bale,
+                state.clone(),
+                config.telegram_token.clone(),
+            ));
+        }
+    }
+
+    if !config.features.telegram_bot {
+        info!("Telegram bot disabled; Bale bot/background services are running");
+        tokio::signal::ctrl_c().await?;
+        return Ok(());
+    }
 
     info!("starting Telegram uploader bot");
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
@@ -678,6 +771,31 @@ async fn oauth_callback_inner(
 async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
     if let Some(text) = msg.text() {
         let trimmed = text.trim();
+        if trimmed == "/reload" && state.access.is_admin(&msg) {
+            if !state.runtime.snapshot().await.features.admin_config_reload {
+                bot.send_message(msg.chat.id, "Admin config reload is disabled.")
+                    .await?;
+                return Ok(());
+            }
+            state.runtime.reload().await?;
+            bot.send_message(msg.chat.id, "Reloaded config.json for runtime feature checks. Restart to change tokens, storage clients, proxies, or allow-lists.").await?;
+            return Ok(());
+        }
+        if trimmed == "/config" && state.access.is_admin(&msg) {
+            let config = state.runtime.snapshot().await;
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "Runtime feature config:
+```json
+{}
+```",
+                    serde_json::to_string_pretty(&config.features)?
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         if trimmed == "/start" || trimmed == "/help" {
             bot.send_message(msg.chat.id, help_text(&state.storage))
                 .await?;
@@ -698,6 +816,14 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
         }
 
         if let Some(url) = extract_direct_link(trimmed) {
+            if !state.runtime.snapshot().await.features.direct_url_uploads {
+                bot.send_message(
+                    msg.chat.id,
+                    "Direct URL uploads are disabled in config.json.",
+                )
+                .await?;
+                return Ok(());
+            }
             let user_id = telegram_user_id(&msg).context("could not identify Telegram user")?;
             if state.storage.uses_oauth() && !state.storage.has_oauth_token(user_id).await {
                 let auth_url = state
@@ -739,6 +865,15 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
             .await?;
             return Ok(());
         }
+    }
+
+    if !state.runtime.snapshot().await.features.telegram_uploads {
+        bot.send_message(
+            msg.chat.id,
+            "Telegram file uploads are disabled in config.json.",
+        )
+        .await?;
+        return Ok(());
     }
 
     let Some(incoming) = extract_incoming_file(&msg) else {
@@ -789,15 +924,32 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
         .link
         .unwrap_or_else(|| "No public link returned".to_owned());
     let uploaded_size = format_bytes(uploaded.size.unwrap_or(total_size));
+    let uploaded_name = uploaded.name.unwrap_or(incoming.name.clone());
     bot.send_message(
         msg.chat.id,
-        format!(
-            "Uploaded: {} ({uploaded_size})\n{}",
-            uploaded.name.unwrap_or(incoming.name),
-            link
-        ),
+        format!("Uploaded: {uploaded_name} ({uploaded_size})\n{link}"),
     )
     .await?;
+    let runtime_config = state.runtime.snapshot().await;
+    if runtime_config.features.telegram_to_bale {
+        if let Some(bale) = runtime_config.bale {
+            if let Some(target_chat_id) = bale.target_chat_id {
+                let telegram_url = format!(
+                    "https://api.telegram.org/file/bot{}/{}",
+                    bot.token(),
+                    file.path
+                );
+                send_bale_document(
+                    &state.telegram_http,
+                    &bale.token,
+                    target_chat_id,
+                    &telegram_url,
+                    Some(&uploaded_name),
+                )
+                .await?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1045,6 +1197,149 @@ fn filename_from_url(url: &reqwest::Url) -> String {
         .unwrap_or_else(|| "download.bin".to_owned())
 }
 
+fn ensure_enabled_storage(config: &Config, storage: &StorageClient) -> Result<()> {
+    match storage {
+        StorageClient::GoogleDrive(_) if !config.features.google_drive_uploads => Err(anyhow!(
+            "Google Drive storage is configured but disabled in features.google_drive_uploads"
+        )),
+        StorageClient::B2(_) if !config.features.b2_uploads => Err(anyhow!(
+            "Backblaze B2 storage is configured but disabled in features.b2_uploads"
+        )),
+        _ => Ok(()),
+    }
+}
+
+async fn send_bale_document(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    document_url: &str,
+    caption: Option<&str>,
+) -> Result<()> {
+    let url = format!("https://tapi.bale.ai/bot{token}/sendDocument");
+    let mut payload = json!({ "chat_id": chat_id, "document": document_url });
+    if let Some(caption) = caption {
+        payload["caption"] = json!(caption);
+    }
+    let response = client
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .context("failed to send Bale document")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("Bale sendDocument failed: HTTP {status} - {body}"));
+    }
+    Ok(())
+}
+
+async fn run_bale_bot(config: BaleConfig, state: AppState, telegram_token: String) {
+    let mut offset = 0_i64;
+    loop {
+        match poll_bale_once(&config, &state, &telegram_token, &mut offset).await {
+            Ok(()) => {}
+            Err(err) => error!(error = ?err, "Bale polling failed"),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BaleUpdates {
+    ok: bool,
+    result: Vec<BaleUpdate>,
+}
+#[derive(Debug, Deserialize)]
+struct BaleUpdate {
+    update_id: i64,
+    message: Option<BaleMessage>,
+}
+#[derive(Debug, Deserialize)]
+struct BaleMessage {
+    chat: BaleChat,
+    text: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct BaleChat {
+    id: i64,
+}
+
+async fn poll_bale_once(
+    config: &BaleConfig,
+    state: &AppState,
+    telegram_token: &str,
+    offset: &mut i64,
+) -> Result<()> {
+    let url = format!("https://tapi.bale.ai/bot{}/getUpdates", config.token);
+    let updates: BaleUpdates = state
+        .telegram_http
+        .get(url)
+        .query(&[("offset", *offset), ("timeout", 20)])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if !updates.ok {
+        return Err(anyhow!("Bale getUpdates returned ok=false"));
+    }
+    for update in updates.result {
+        *offset = update.update_id + 1;
+        let Some(message) = update.message else {
+            continue;
+        };
+        let Some(text) = message.text.as_deref().and_then(extract_direct_link) else {
+            continue;
+        };
+        let runtime = state.runtime.snapshot().await;
+        if runtime.features.bale_to_telegram {
+            if let Some(target) = runtime.bale.as_ref().and_then(|b| b.target_chat_id) {
+                send_telegram_document(&state.telegram_http, telegram_token, target, text).await?;
+            }
+        } else if runtime.features.direct_url_uploads {
+            let parsed_url = validate_direct_url(text)?;
+            let (name, mime_type, total_size, stream) =
+                direct_url_stream(&state.telegram_http, parsed_url).await?;
+            state
+                .storage
+                .upload_stream(
+                    message.chat.id as u64,
+                    &name,
+                    mime_type.as_deref(),
+                    total_size,
+                    stream,
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_telegram_document(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    document_url: &str,
+) -> Result<()> {
+    let url = format!("https://api.telegram.org/bot{token}/sendDocument");
+    let response = client
+        .post(url)
+        .json(&json!({ "chat_id": chat_id, "document": document_url }))
+        .send()
+        .await
+        .context("failed to send Telegram document")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Telegram sendDocument failed: HTTP {status} - {body}"
+        ));
+    }
+    Ok(())
+}
+
 impl DriveClient {
     async fn from_config(http: Client, config: &Config) -> Result<Self> {
         let folder_id = config
@@ -1056,58 +1351,20 @@ impl DriveClient {
             .google
             .as_ref()
             .context("Google Drive storage requires google config")?;
-        let auth = match google {
-            GoogleConfig::OAuth {
-                client_id,
-                client_secret,
-                redirect_uri,
-                tokens_file,
-            } => {
-                let tokens = load_oauth_tokens(tokens_file).await?;
-                DriveAuth::OAuth {
-                    client_id: client_id.clone(),
-                    client_secret: client_secret.clone(),
-                    redirect_uri: redirect_uri.clone(),
-                    tokens_path: tokens_file.clone(),
-                    tokens: Mutex::new(tokens),
-                    pending_states: Mutex::new(HashMap::new()),
-                }
-            }
-            GoogleConfig::ServiceAccount {
-                json_file,
-                json,
-                delegated_user,
-            } => {
-                let key_json = match (json, json_file) {
-                    (Some(raw), _) if !raw.is_empty() => raw.clone(),
-                    (_, Some(path)) => {
-                        tokio::fs::read_to_string(path).await.with_context(|| {
-                            format!("failed to read service-account JSON at {}", path.display())
-                        })?
-                    }
-                    _ => {
-                        return Err(anyhow!(
-                            "service_account mode requires google.json_file or google.json"
-                        ))
-                    }
-                };
-                let delegated_user = delegated_user
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned);
-                if folder_id.is_none() && delegated_user.is_none() {
-                    return Err(anyhow!(
-                        "service_account mode requires google_drive_folder_id (shared-drive folder) or google.delegated_user (workspace delegation)"
-                    ));
-                }
-                DriveAuth::ServiceAccount {
-                    key: serde_json::from_str(&key_json)
-                        .context("invalid Google service-account JSON")?,
-                    delegated_user,
-                    token: Mutex::new(None),
-                }
-            }
+        let GoogleConfig::OAuth {
+            client_id,
+            client_secret,
+            redirect_uri,
+            tokens_file,
+        } = google;
+        let tokens = load_oauth_tokens(tokens_file).await?;
+        let auth = DriveAuth::OAuth {
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+            redirect_uri: redirect_uri.clone(),
+            tokens_path: tokens_file.clone(),
+            tokens: Mutex::new(tokens),
+            pending_states: Mutex::new(HashMap::new()),
         };
 
         Ok(Self {
@@ -1118,13 +1375,12 @@ impl DriveClient {
     }
 
     fn uses_oauth(&self) -> bool {
-        matches!(self.auth, DriveAuth::OAuth { .. })
+        true
     }
 
     async fn has_oauth_token(&self, telegram_user_id: u64) -> bool {
         match &self.auth {
             DriveAuth::OAuth { tokens, .. } => tokens.lock().await.contains_key(&telegram_user_id),
-            DriveAuth::ServiceAccount { .. } => true,
         }
     }
 
@@ -1134,10 +1390,7 @@ impl DriveClient {
             redirect_uri,
             pending_states,
             ..
-        } = &self.auth
-        else {
-            return Err(anyhow!("OAuth is not enabled for this bot"));
-        };
+        } = &self.auth;
         let state = Uuid::new_v4().to_string();
         pending_states.lock().await.insert(
             state.clone(),
@@ -1163,10 +1416,7 @@ impl DriveClient {
             tokens_path,
             tokens,
             pending_states,
-        } = &self.auth
-        else {
-            return Err(anyhow!("OAuth is not enabled for this bot"));
-        };
+        } = &self.auth;
         let pending = pending_states
             .lock()
             .await
@@ -1347,75 +1597,28 @@ impl DriveClient {
     }
 
     async fn access_token(&self, telegram_user_id: u64) -> Result<String> {
-        match &self.auth {
-            DriveAuth::ServiceAccount {
-                key,
-                delegated_user,
-                token,
-            } => {
-                let now = Instant::now();
-                if let Some(token) = token.lock().await.as_ref() {
-                    if token.expires_at > now + Duration::from_secs(60) {
-                        return Ok(token.value.clone());
-                    }
-                }
-                let fresh = self
-                    .fetch_service_account_access_token(key, delegated_user.as_deref())
-                    .await?;
-                let value = fresh.value.clone();
-                *token.lock().await = Some(fresh);
-                Ok(value)
-            }
-            DriveAuth::OAuth {
-                tokens_path,
-                tokens,
-                ..
-            } => {
-                let current = tokens
-                    .lock()
-                    .await
-                    .get(&telegram_user_id)
-                    .cloned()
-                    .context("run /auth to connect Google Drive first")?;
-                if current.expires_at_unix > unix_now() + 60 {
-                    return Ok(current.access_token);
-                }
-                let refreshed = self
-                    .refresh_oauth_access_token(&current.refresh_token)
-                    .await?;
-                let value = refreshed.access_token.clone();
-                let mut guard = tokens.lock().await;
-                guard.insert(telegram_user_id, refreshed);
-                save_oauth_tokens(tokens_path, &guard).await?;
-                Ok(value)
-            }
+        let DriveAuth::OAuth {
+            tokens_path,
+            tokens,
+            ..
+        } = &self.auth;
+        let current = tokens
+            .lock()
+            .await
+            .get(&telegram_user_id)
+            .cloned()
+            .context("run /auth to connect Google Drive first")?;
+        if current.expires_at_unix > unix_now() + 60 {
+            return Ok(current.access_token);
         }
-    }
-
-    async fn fetch_service_account_access_token(
-        &self,
-        key: &ServiceAccountKey,
-        delegated_user: Option<&str>,
-    ) -> Result<AccessToken> {
-        let assertion = self.signed_jwt(key, delegated_user)?;
-        let response: TokenResponse = self
-            .http
-            .post(&key.token_uri)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-                ("assertion", assertion.as_str()),
-            ])
-            .send()
-            .await
-            .context("failed to request Google access token")?
-            .error_for_status()?
-            .json()
-            .await
-            .context("failed to parse Google token response")?;
-        Ok(AccessToken {
-            value: response.access_token,
-            expires_at: Instant::now() + Duration::from_secs(response.expires_in),
-        })
+        let refreshed = self
+            .refresh_oauth_access_token(&current.refresh_token)
+            .await?;
+        let value = refreshed.access_token.clone();
+        let mut guard = tokens.lock().await;
+        guard.insert(telegram_user_id, refreshed);
+        save_oauth_tokens(tokens_path, &guard).await?;
+        Ok(value)
     }
 
     async fn refresh_oauth_access_token(&self, refresh_token: &str) -> Result<PersistedOAuthToken> {
@@ -1423,10 +1626,7 @@ impl DriveClient {
             client_id,
             client_secret,
             ..
-        } = &self.auth
-        else {
-            return Err(anyhow!("OAuth is not enabled for this bot"));
-        };
+        } = &self.auth;
         let response: TokenResponse = self
             .http
             .post(TOKEN_URL)
@@ -1450,42 +1650,6 @@ impl DriveClient {
                 .unwrap_or_else(|| refresh_token.to_owned()),
             expires_at_unix: unix_now() + response.expires_in,
         })
-    }
-
-    fn signed_jwt(&self, key: &ServiceAccountKey, delegated_user: Option<&str>) -> Result<String> {
-        let iat = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        let header = json!({ "alg": "RS256", "typ": "JWT" });
-        let claims = Claims {
-            iss: &key.client_email,
-            scope: DRIVE_SCOPE,
-            aud: &key.token_uri,
-            sub: delegated_user,
-            iat,
-            exp: iat + 3600,
-        };
-        let signing_input = format!(
-            "{}.{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?),
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?)
-        );
-        let der = pem_to_der(&key.private_key)?;
-        let key_pair = RsaKeyPair::from_pkcs8(&der)
-            .map_err(|_| anyhow!("invalid service-account private key"))?;
-        let mut signature = vec![0; key_pair.public().modulus_len()];
-        key_pair
-            .sign(
-                &ring::signature::RSA_PKCS1_SHA256,
-                &ring::rand::SystemRandom::new(),
-                signing_input.as_bytes(),
-                &mut signature,
-            )
-            .map_err(|_| anyhow!("failed to sign Google JWT"))?;
-        Ok(format!(
-            "{signing_input}.{}",
-            URL_SAFE_NO_PAD.encode(signature)
-        ))
     }
 }
 
@@ -1512,14 +1676,4 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
-    let body = pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect::<String>();
-    base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .context("failed to decode PEM private key")
 }
