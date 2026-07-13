@@ -1,6 +1,6 @@
-# Telegram → Google Drive uploader bot
+# Telegram → cloud storage uploader bot
 
-A resource-efficient Telegram bot written with [`teloxide`](https://github.com/teloxide/teloxide) that streams incoming files to Google Drive with Google Drive resumable uploads.
+A resource-efficient Telegram bot written with [`teloxide`](https://github.com/teloxide/teloxide) that streams incoming files to Google Drive or Backblaze B2 without staging whole files on your VPS disk.
 
 ## Features
 
@@ -8,9 +8,9 @@ A resource-efficient Telegram bot written with [`teloxide`](https://github.com/t
 - Accepts documents, videos, audio, voice messages, and photos.
 - Accepts direct HTTP/HTTPS links via `/url <link>` (or by sending a raw link message).
 - Downloads from Telegram as an async byte stream.
-- Uploads to Google Drive in 8 MiB resumable chunks, so files are never fully buffered in RAM or written to disk.
+- Uploads to Google Drive in 8 MiB resumable chunks, or streams directly to Backblaze B2 single-file upload, so files are never fully buffered in RAM or written to disk.
 - Reuses one `reqwest::Client` for connection pooling.
-- Supports two Google Drive authentication modes:
+- Supports Backblaze B2 buckets and two Google Drive authentication modes:
   - **Per-user OAuth:** each allowed Telegram user runs `/auth`, opens a Google consent page, and uploads go to that user's Drive.
   - **Service account:** uploads go to a shared-drive folder or (with domain-wide delegation) a delegated Workspace user's Drive.
 - Supports multiple Telegram users with separate OAuth token storage.
@@ -30,8 +30,9 @@ CONFIG_PATH=/etc/telegram-drive-uploader/config.json ./telegram-drive-uploader
 
 Start from one of the included templates:
 
-- `config.example.json` for per-user OAuth mode.
-- `config.service-account.example.json` for service-account mode.
+- `config.example.json` for Google Drive per-user OAuth mode.
+- `config.service-account.example.json` for Google Drive service-account mode.
+- `config.b2.example.json` for Backblaze B2 mode.
 
 ### Common JSON fields
 
@@ -39,7 +40,6 @@ Start from one of the included templates:
 {
   "telegram_token": "123456:telegram-token",
   "allowed_telegram_usernames": ["alice", "@bob"],
-  "google_drive_folder_id": "optional-folder-id",
   "proxy": {
     "all": "socks5h://127.0.0.1:1080",
     "telegram_receive": "",
@@ -50,11 +50,12 @@ Start from one of the included templates:
 
 - `telegram_token` is required.
 - `allowed_telegram_usernames` is optional. If the list is non-empty, anyone not in the list is ignored without a reply. Usernames are case-insensitive and may include or omit `@`.
-- `google_drive_folder_id` is optional.
+- For new configs, choose `storage.provider`: `google_drive` or `b2`. Legacy top-level `google` and `google_drive_folder_id` still work for existing deployments.
 - `proxy` is optional:
   - `proxy.all` applies one proxy URL to all HTTP traffic.
   - `proxy.telegram_receive` overrides proxy only for Telegram receive/download flow.
   - `proxy.google_drive` overrides proxy only for Google Drive upload/auth flow.
+  - `proxy.b2` overrides proxy only for Backblaze B2 upload/auth flow.
   - Empty strings are ignored.
 
 ## Option A: per-user OAuth consent flow
@@ -75,16 +76,19 @@ Use this mode when multiple users should connect their own Google Drive accounts
    {
      "telegram_token": "123456:telegram-token",
      "allowed_telegram_usernames": ["alice", "@bob"],
-     "google_drive_folder_id": "optional-folder-id",
      "oauth_server": {
        "bind_addr": "0.0.0.0:8080"
      },
-     "google": {
-       "mode": "oauth",
-       "client_id": "google-client-id.apps.googleusercontent.com",
-       "client_secret": "google-client-secret",
-       "redirect_uri": "https://your-domain.example/oauth2/callback",
-       "tokens_file": "./google-oauth-tokens.json"
+     "storage": {
+       "provider": "google_drive",
+       "folder_id": "optional-folder-id",
+       "google": {
+         "mode": "oauth",
+         "client_id": "google-client-id.apps.googleusercontent.com",
+         "client_secret": "google-client-secret",
+         "redirect_uri": "https://your-domain.example/oauth2/callback",
+         "tokens_file": "./google-oauth-tokens.json"
+       }
      }
    }
    ```
@@ -98,7 +102,7 @@ Use this mode when uploads should use one service account identity.
 1. Create a Google Cloud service account, enable the Google Drive API, and download the service-account JSON key.
 
 2. Choose one destination strategy:
-   - **Shared Drive folder (recommended):** create or choose a folder in a Shared Drive and share it with the service account `client_email`, then set `google_drive_folder_id`.
+   - **Shared Drive folder (recommended):** create or choose a folder in a Shared Drive and share it with the service account `client_email`, then set `storage.folder_id`.
    - **Workspace domain-wide delegation:** configure domain-wide delegation for the service account and set `google.delegated_user` to a user in your Workspace domain.
 
 3. Configure service-account mode in JSON:
@@ -107,16 +111,40 @@ Use this mode when uploads should use one service account identity.
    {
      "telegram_token": "123456:telegram-token",
      "allowed_telegram_usernames": ["alice", "@bob"],
-     "google_drive_folder_id": "shared-drive-folder-id",
-     "google": {
-       "mode": "service_account",
-       "json_file": "/secure/path/service-account.json",
-       "delegated_user": "optional-user@your-workspace-domain.com"
+     "storage": {
+       "provider": "google_drive",
+       "folder_id": "shared-drive-folder-id",
+       "google": {
+         "mode": "service_account",
+         "json_file": "/secure/path/service-account.json",
+         "delegated_user": "optional-user@your-workspace-domain.com"
+       }
      }
    }
    ```
 
-   You can also use a `json` string field instead of `json_file`, but `json_file` is recommended so the main bot config stays readable. If you do not set `google.delegated_user`, set `google_drive_folder_id` to a Shared Drive folder ID.
+   You can also use a `json` string field instead of `json_file`, but `json_file` is recommended so the main bot config stays readable. If you do not set `google.delegated_user`, set `storage.folder_id` to a Shared Drive folder ID.
+
+
+## Option C: Backblaze B2 mode
+
+Use B2 when you want storage independent of Google Drive quotas. The bot streams the Telegram/direct-link response into B2 with a known `Content-Length`; it does not write the file to VPS disk.
+
+```json
+{
+  "telegram_token": "123456:telegram-token",
+  "allowed_telegram_usernames": ["alice", "@bob"],
+  "storage": {
+    "provider": "b2",
+    "key_id": "backblaze-key-id",
+    "application_key": "backblaze-application-key",
+    "bucket_id": "backblaze-bucket-id",
+    "file_prefix": "telegram-uploads"
+  }
+}
+```
+
+B2 single-file uploads are limited to 5 GiB. This keeps the implementation diskless; multipart B2 uploads require buffering each part to compute checksums before upload.
 
 ## Run locally
 
@@ -158,4 +186,4 @@ You can also run the workflow manually from GitHub Actions to get an artifact wi
 
 ## Notes for large files
 
-Telegram bot download limits still apply to bot accounts, and Google Drive quota/rate limits still apply to the connected user, service account, or shared destination. The bot itself keeps memory bounded to approximately one upload chunk plus transport overhead.
+Telegram bot download limits still apply to bot accounts, and Google Drive quota/rate limits still apply to the connected user, service account, or shared destination. Service accounts no longer have personal Drive storage quota; use a Shared Drive folder or Workspace domain-wide delegation. B2 bucket limits apply in B2 mode. The bot itself keeps memory bounded to approximately one upload chunk plus transport overhead.
